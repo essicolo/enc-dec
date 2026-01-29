@@ -96,27 +96,21 @@ print(f"Cu: {Cu.min()*100:.2f}% – {Cu.max()*100:.2f}%")
 # ## ILR transform
 
 # %%
+# Matrice de contraste pour ILR (Helmert) — shared across forward/inverse
+V_helmert = np.array([
+    [np.sqrt(3/4), -1/np.sqrt(12), -1/np.sqrt(12), -1/np.sqrt(12)],
+    [0, np.sqrt(2/3), -1/np.sqrt(6), -1/np.sqrt(6)],
+    [0, 0, np.sqrt(1/2), -np.sqrt(1/2)]
+])
+
 def ilr_transform(comp):
     """Compositions (n, 4) → ILR (n, 3)"""
     log_comp = np.log(comp + 1e-10)
-    # Matrice de contraste pour ILR (Helmert)
-    # Pour 4 composantes, on a une matrice 3x4
-    V = np.array([
-        [np.sqrt(3/4), -1/np.sqrt(12), -1/np.sqrt(12), -1/np.sqrt(12)],
-        [0, np.sqrt(2/3), -1/np.sqrt(6), -1/np.sqrt(6)],
-        [0, 0, np.sqrt(1/2), -np.sqrt(1/2)]
-    ])
-    return log_comp @ V.T
+    return log_comp @ V_helmert.T
 
 def ilr_inverse(ilr):
     """ILR (n, 3) → Compositions (n, 4)"""
-    # Inverse: V.T @ V = I, donc on utilise V.T pour reconstruire
-    V = np.array([
-        [np.sqrt(3/4), -1/np.sqrt(12), -1/np.sqrt(12), -1/np.sqrt(12)],
-        [0, np.sqrt(2/3), -1/np.sqrt(6), -1/np.sqrt(6)],
-        [0, 0, np.sqrt(1/2), -np.sqrt(1/2)]
-    ])
-    log_comp = ilr @ V
+    log_comp = ilr @ V_helmert
     comp = np.exp(log_comp)
     return comp / comp.sum(axis=1, keepdims=True)
 
@@ -142,23 +136,33 @@ receivers = magnetics.receivers.Point(
 # source: "quel champ magnétique ambiant?"
 source = magnetics.sources.UniformBackgroundField(
     receiver_list=[receivers],
-    amplitude=55000, # |B| en nT # en pratique le champ est variable, mais simpeg sais pas trop quoi faire avec la réalité d'un champ variable
+    amplitude=55000, # |B| en nT
     inclination=70, # angle vertical
     declination=0 # angle horizontal
 )
 survey = magnetics.Survey(source)
 
-# Simulation
+# Simulation — Fix #1: store_sensitivities='ram' to access the G matrix
 sim = magnetics.Simulation3DIntegral(
-    mesh=mesh, # La grille 3D de cellules
-    survey=survey, # Où mesurer + champ de fond
-    chiMap=maps.IdentityMap(mesh),# χ_input → χ_model (ici: pas de transformation)
-    active_cells=np.ones(n_cells, dtype=bool),# Quelles cellules sont "actives" (pas de l'air)
-    store_sensitivities='forward_only'# Ne pas stocker la matrice jacobienne (économie mémoire)
+    mesh=mesh,
+    survey=survey,
+    chiMap=maps.IdentityMap(mesh),
+    active_cells=np.ones(n_cells, dtype=bool),
+    store_sensitivities='ram'  # Fix #1: store G matrix in RAM
 )
-mag_observed = sim.dpred(susceptibility_true) + np.random.randn(len(stations)) * 1.5
+
+# Fix #7: Reproducible noise with seeded numpy RNG
+rng_np = np.random.default_rng(42)
+mag_observed = sim.dpred(susceptibility_true) + rng_np.normal(0, 1.5, len(stations))
+
+# Fix #1: Extract sensitivity matrix for exact JAX forward model
+# The forward problem is linear: mag = G @ chi
+# This replaces the approximate dipole formula with SimPEG's exact computation.
+G_matrix = sim.G
+G_jax = jnp.array(G_matrix)
 
 print(f"Magnétique: {mag_observed.min():.1f} – {mag_observed.max():.1f} nT")
+print(f"Matrice de sensibilité G: {G_matrix.shape}")
 
 # %%
 # Visualiser
@@ -174,105 +178,131 @@ df_mag = pd.DataFrame({'x': stations[:,0], 'y': stations[:,1], 'mag': mag_observ
 # ## Forages
 
 # %%
-# Plus de forages pour mieux contraindre
+# Fix #8: Hold out DH4 and DH7 for validation
+# Fix #12: Add realistic assay noise (5% relative)
+
 hole_xy = [
     (1500, 1500), (2800, 2500), (500, 500), (2000, 2000), (3500, 1000),
     (1200, 1800), (2500, 2200), (1800, 2800), (3000, 1500), (800, 2500)
 ]
+
+validation_holes = {'DH4', 'DH7'}
+noise_rel = 0.05  # 5% relative noise on assays
+
 forages = []
 for i, (hx, hy) in enumerate(hole_xy):
     ix, iy = np.argmin(np.abs(mesh.cell_centers_x - hx)), np.argmin(np.abs(mesh.cell_centers_y - hy))
     for iz in range(nz):
         idx = ix + iy * nx + iz * nx * ny
+        # Fix #12: Add realistic assay noise
+        cu_noisy = max(Cu[idx] * (1 + rng_np.normal(0, noise_rel)), 1e-6)
+        ni_noisy = max(Ni[idx] * (1 + rng_np.normal(0, noise_rel)), 1e-6)
+        co_noisy = max(Co[idx] * (1 + rng_np.normal(0, noise_rel)), 1e-6)
+        gangue_noisy = max(1 - cu_noisy - ni_noisy - co_noisy, 1e-6)
+        comp_noisy = np.array([[cu_noisy, ni_noisy, co_noisy, gangue_noisy]])
+        ilr_noisy = ilr_transform(comp_noisy)[0]
+
+        hole_name = f'DH{i+1}'
         forages.append({
-            'hole': f'DH{i+1}', 'x': mesh.cell_centers_x[ix], 'y': mesh.cell_centers_y[iy],
-            'z': mesh.cell_centers_z[iz], 'Cu': Cu[idx], 'Ni': Ni[idx], 
-            'ilr0': ilr_true[idx, 0], 'ilr1': ilr_true[idx, 1], 'ilr2': ilr_true[idx, 2]
+            'hole': hole_name, 'x': mesh.cell_centers_x[ix], 'y': mesh.cell_centers_y[iy],
+            'z': mesh.cell_centers_z[iz],
+            'Cu': cu_noisy, 'Ni': ni_noisy, 'Co': co_noisy,
+            'ilr0': ilr_noisy[0], 'ilr1': ilr_noisy[1], 'ilr2': ilr_noisy[2],
+            'is_validation': hole_name in validation_holes
         })
+
 df_forages = pd.DataFrame(forages)
-print(f"Échantillons: {len(df_forages)}")
+df_train = df_forages[~df_forages['is_validation']].reset_index(drop=True)
+df_val = df_forages[df_forages['is_validation']].reset_index(drop=True)
+
+print(f"Échantillons total: {len(df_forages)} | train: {len(df_train)} | validation: {len(df_val)}")
 
 # %% [markdown]
 # ---
 # # Partie 2: Forward model différentiable en JAX
 #
-# SimPEG n'est pas différentiable. On écrit une version simplifiée en JAX
-# pour pouvoir backpropager le gradient.
+# Fix #1: On utilise la matrice de sensibilité G de SimPEG plutôt qu'une
+# approximation dipôle. Le problème forward étant linéaire (mag = G @ χ),
+# c'est exact et directement différentiable en JAX.
 
 # %%
 @jit
-def forward_magnetic_jax(susceptibility, stations, cell_centers, cell_volume, B0=55000.0):
-    """
-    Forward magnétique simplifié (approximation dipôle).
-    
-    χ(x) contribue au champ mesuré en s avec une atténuation 1/r³
-    """
-    def contribution_at_station(station):
-        # Vecteur station - cellule
-        r_vec = station - cell_centers  # (n_cells, 3)
-        r = jnp.sqrt(jnp.sum(r_vec**2, axis=1) + 1e-6)  # (n_cells,)
-        
-        # Composante verticale simplifiée (inclinaison ~70°)
-        cos_theta = r_vec[:, 2] / r
-        
-        # Contribution dipôle
-        contrib = susceptibility * B0 * cell_volume * (3 * cos_theta**2 - 1) / (4 * jnp.pi * r**3)
-        return jnp.sum(contrib)
-    
-    return vmap(contribution_at_station)(stations)
+def forward_magnetic_jax(susceptibility):
+    """Forward magnétique exact via la matrice de sensibilité G de SimPEG."""
+    return G_jax @ susceptibility
 
 # Test
-cc_jax = jnp.array(cc)
-stations_jax = jnp.array(stations)
-cell_volume = dx * dy * dz
-
-mag_test = forward_magnetic_jax(jnp.array(susceptibility_true), stations_jax, cc_jax, cell_volume)
-print(f"Forward JAX: {float(mag_test.min()):.1f} – {float(mag_test.max()):.1f}")
+mag_test = forward_magnetic_jax(jnp.array(susceptibility_true))
+print(f"Forward JAX (G matrix): {float(mag_test.min()):.1f} – {float(mag_test.max()):.1f}")
+print(f"SimPEG dpred:           {mag_observed.min():.1f} – {mag_observed.max():.1f}")
 
 # %% [markdown]
 # ---
 # # Partie 3: Architecture du réseau
 
 # %%
+# Fix #6: Fourier features for positional encoding
+def fourier_features(coords, n_freqs=6):
+    """Encode coordinates with Fourier features to overcome spectral bias."""
+    freqs = 2.0 ** jnp.arange(n_freqs)
+    x = coords[..., jnp.newaxis] * freqs  # (3, n_freqs)
+    x = x.reshape(-1)  # (3 * n_freqs,)
+    return jnp.concatenate([jnp.sin(x), jnp.cos(x)])  # (3 * n_freqs * 2,)
+
+n_fourier = 3 * 6 * 2  # 36
+
+# %%
+# Fix #3: CNN encoder to preserve spatial structure of the magnetic grid
 class Encoder(nn.Module):
-    """Magnétique 2D → distribution sur le latent"""
+    """Magnétique 2D → distribution sur le latent (CNN)"""
     latent_dim: int = 32
-    
+
     @nn.compact
     def __call__(self, mag_grid):
-        x = mag_grid.ravel()
-        x = nn.Dense(128)(x)
+        x = mag_grid[jnp.newaxis, :, :, jnp.newaxis]  # (1, 12, 12, 1)
+        x = nn.Conv(16, kernel_size=(3, 3), padding='SAME')(x)
         x = nn.relu(x)
-        x = nn.Dense(64)(x)
+        x = nn.Conv(32, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.relu(x)
+        x = nn.Conv(64, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.relu(x)
+        x = x.ravel()
+        x = nn.Dense(128)(x)
         x = nn.relu(x)
         mu = nn.Dense(self.latent_dim)(x)
         log_var = nn.Dense(self.latent_dim)(x)
         return mu, log_var
 
 
+# Fix #4: Wider decoder layers (256→512→1024)
+# Fix #5: softplus scaling instead of exp * 0.01
 class DecoderSusceptibility(nn.Module):
     """Latent → susceptibilité 3D (une valeur par cellule)"""
     n_cells: int
-    
+
     @nn.compact
     def __call__(self, latent):
-        x = nn.Dense(64)(latent)
+        x = nn.Dense(256)(latent)
         x = nn.relu(x)
-        x = nn.Dense(128)(x)
+        x = nn.Dense(512)(x)
         x = nn.relu(x)
-        x = nn.Dense(256)(x)
+        x = nn.Dense(1024)(x)
         x = nn.relu(x)
-        # Sortie: log-susceptibilité (pour garantir χ > 0)
-        log_chi = nn.Dense(self.n_cells)(x)
-        return jnp.exp(log_chi) * 0.01  # scaling pour être dans le bon range
+        raw = nn.Dense(self.n_cells)(x)
+        # Fix #5: softplus for numerically stable positive output
+        # softplus grows linearly (not exponentially), avoiding overflow
+        chi_scale = 0.01
+        return nn.softplus(raw) * chi_scale
 
 
+# Fix #6: DecoderILR with Fourier features for positional encoding
 class DecoderILR(nn.Module):
-    """Latent + coordonnées normalisées → ILR à cette position"""
-    
+    """Latent + Fourier-encoded coordinates → ILR à cette position"""
+
     @nn.compact
     def __call__(self, latent, coord_norm):
-        x = jnp.concatenate([latent, coord_norm])
+        ff = fourier_features(coord_norm)
+        x = jnp.concatenate([latent, ff])
         x = nn.Dense(128)(x)
         x = nn.relu(x)
         x = nn.Dense(64)(x)
@@ -287,53 +317,71 @@ class DecoderILR(nn.Module):
 # # Partie 4: Loss function avec PINN
 
 # %%
-def loss_fn(params, encoder, dec_susc, dec_ilr, 
+# Fix #2: Spatial smoothness regularization
+def smoothness_loss(chi, nx, ny, nz):
+    """Finite-difference smoothness penalty on 3D susceptibility field."""
+    chi_3d = chi.reshape(nz, ny, nx)
+    dx = jnp.sum((chi_3d[:, :, 1:] - chi_3d[:, :, :-1])**2)
+    dy = jnp.sum((chi_3d[:, 1:, :] - chi_3d[:, :-1, :])**2)
+    dz = jnp.sum((chi_3d[1:, :, :] - chi_3d[:-1, :, :])**2)
+    return (dx + dy + dz) / chi.size
+
+
+def loss_fn(params, encoder, dec_susc, dec_ilr,
             mag_grid, mag_observed,
             train_coords_norm, train_ilr,
-            stations, cell_centers, cell_volume,
-            rng_key, lambda_physics=1.0, lambda_kl=0.01):
+            rng_key, lambda_physics=1.0, lambda_kl=0.01,
+            lambda_smooth=0.1):
     """
-    Loss totale = reconstruction ILR + KL + physique
-    
+    Loss totale = reconstruction ILR + KL + physique + smoothness
+
     La loss physique (PINN) force la susceptibilité décodée à reproduire
     les observations magnétiques quand on la passe dans le forward model.
+    Fix #2: Added smoothness regularization for ill-posed inverse problem.
     """
-    
+
     # --- Encoder ---
     mu, log_var = encoder.apply(params['encoder'], mag_grid)
-    
+
     # Reparameterization trick
     std = jnp.exp(0.5 * log_var)
     eps = random.normal(rng_key, mu.shape)
     z = mu + std * eps
-    
+
     # --- Decoder susceptibilité ---
     chi_pred = dec_susc.apply(params['dec_susc'], z)
-    
-    # --- Forward model (PINN) ---
-    mag_pred = forward_magnetic_jax(chi_pred, stations, cell_centers, cell_volume)
-    
+
+    # --- Forward model (PINN) — Fix #1: exact G matrix ---
+    mag_pred = forward_magnetic_jax(chi_pred)
+
     # Loss physique: le magnétique prédit doit matcher l'observé
     loss_physics = jnp.mean((mag_pred - mag_observed)**2) / jnp.var(mag_observed)
-    
+
+    # --- Fix #2: Spatial smoothness ---
+    loss_smooth = smoothness_loss(chi_pred, nx, ny, nz)
+
     # --- Decoder ILR ---
     def predict_ilr(coord):
         return dec_ilr.apply(params['dec_ilr'], z, coord)
-    
+
     ilr_pred = vmap(predict_ilr)(train_coords_norm)
-    
+
     # Loss reconstruction ILR
     loss_recon = jnp.mean((ilr_pred - train_ilr)**2)
-    
+
     # --- KL divergence ---
     loss_kl = -0.5 * jnp.mean(1 + log_var - mu**2 - jnp.exp(log_var))
-    
+
     # --- Total ---
-    loss_total = loss_recon + lambda_kl * loss_kl + lambda_physics * loss_physics
-    
+    loss_total = (loss_recon
+                  + lambda_kl * loss_kl
+                  + lambda_physics * loss_physics
+                  + lambda_smooth * loss_smooth)
+
     return loss_total, {
-        'total': loss_total, 'recon': loss_recon, 
+        'total': loss_total, 'recon': loss_recon,
         'kl': loss_kl, 'physics': loss_physics,
+        'smooth': loss_smooth,
         'chi_mean': jnp.mean(chi_pred), 'chi_max': jnp.max(chi_pred)
     }
 
@@ -363,53 +411,70 @@ params = {
 }
 
 # %%
-# Préparer les données
+# Préparer les données — Fix #8: use training set only
 mag_grid = jnp.array(mag_observed.reshape(n_stations, n_stations))
 mag_grid_norm = (mag_grid - mag_grid.mean()) / (mag_grid.std() + 1e-6)
 
 mag_obs_jax = jnp.array(mag_observed)
-stations_jax = jnp.array(stations)
-cc_jax = jnp.array(cc)
 
-# Coordonnées des forages normalisées
+# Coordonnées des forages normalisées (training only)
 coord_mean = jnp.array([nx*dx/2, ny*dy/2, -nz*dz/2])
 coord_std = jnp.array([nx*dx/2, ny*dy/2, nz*dz/2])
-train_coords_norm = jnp.array((df_forages[['x', 'y', 'z']].values - np.array(coord_mean)) / np.array(coord_std))
-train_ilr = jnp.array(df_forages[['ilr0', 'ilr1', 'ilr2']].values)
+train_coords_norm = jnp.array((df_train[['x', 'y', 'z']].values - np.array(coord_mean)) / np.array(coord_std))
+train_ilr = jnp.array(df_train[['ilr0', 'ilr1', 'ilr2']].values)
+
+# Validation coordinates
+val_coords_norm = jnp.array((df_val[['x', 'y', 'z']].values - np.array(coord_mean)) / np.array(coord_std))
+val_ilr = jnp.array(df_val[['ilr0', 'ilr1', 'ilr2']].values)
 
 print(f"Prêt pour l'entraînement")
 
 # %%
-# Optimizer
-optimizer = optax.adam(1e-3)
+# Fix #10: Learning rate schedule with warmup cosine decay
+n_epochs = 2000
+schedule = optax.warmup_cosine_decay_schedule(
+    init_value=1e-4,
+    peak_value=1e-3,
+    warmup_steps=100,
+    decay_steps=n_epochs
+)
+optimizer = optax.adam(schedule)
 opt_state = optimizer.init(params)
 
+# Fix #9: KL annealing parameters
+kl_warmup_epochs = 500
+kl_target = 0.01
+
 @jit
-def train_step(params, opt_state, rng_key):
+def train_step(params, opt_state, rng_key, lambda_kl):
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
         params, encoder, dec_susc, dec_ilr,
         mag_grid_norm, mag_obs_jax,
         train_coords_norm, train_ilr,
-        stations_jax, cc_jax, cell_volume,
-        rng_key, lambda_physics=0.05, lambda_kl=0.001
+        rng_key, lambda_physics=0.1, lambda_kl=lambda_kl,
+        lambda_smooth=0.1
     )
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
     return params, opt_state, loss, aux
 
 # %%
-# Boucle d'entraînement
+# Boucle d'entraînement avec KL annealing (Fix #9)
 history = []
-n_epochs = 2000
 
 for epoch in range(n_epochs):
     rng, step_rng = random.split(rng)
-    params, opt_state, loss, aux = train_step(params, opt_state, step_rng)
+
+    # Fix #9: KL annealing — linearly increase from 0 to kl_target
+    lambda_kl = jnp.float32(min(epoch / kl_warmup_epochs, 1.0) * kl_target)
+
+    params, opt_state, loss, aux = train_step(params, opt_state, step_rng, lambda_kl)
     history.append({**{k: float(v) for k, v in aux.items()}, 'epoch': epoch})
-    
+
     if epoch % 400 == 0:
         print(f"Epoch {epoch:4d} | loss={aux['total']:.4f} | recon={aux['recon']:.4f} | "
-              f"physics={aux['physics']:.4f} | χ_max={aux['chi_max']:.4f}")
+              f"physics={aux['physics']:.4f} | smooth={aux['smooth']:.6f} | "
+              f"χ_max={aux['chi_max']:.4f} | λ_kl={float(lambda_kl):.4f}")
 
 # %%
 # Courbes de loss
@@ -419,6 +484,7 @@ df_hist = pd.DataFrame(history)
     lp.ggplot(df_hist, lp.aes(x='epoch'))
     + lp.geom_line(lp.aes(y='recon'), color="#962561")
     + lp.geom_line(lp.aes(y='physics'), color="#abc000")
+    + lp.geom_line(lp.aes(y='smooth'), color="#00abc0")
     + lp.scale_y_log10()
     + lp.labs(title='Entraînement', x='Epoch', y='Loss (log)')
 )
@@ -440,7 +506,7 @@ print(f"χ vrai:   {susceptibility_true.min():.4f} – {susceptibility_true.max(
 
 # %%
 # Vérifier le forward
-mag_from_pred = forward_magnetic_jax(chi_pred, stations_jax, cc_jax, cell_volume)
+mag_from_pred = forward_magnetic_jax(chi_pred)
 print(f"Mag prédit: {float(mag_from_pred.min()):.1f} – {float(mag_from_pred.max()):.1f}")
 print(f"Mag observé: {mag_observed.min():.1f} – {mag_observed.max():.1f}")
 
@@ -452,8 +518,8 @@ print(f"Mag observé: {mag_observed.min():.1f} – {mag_observed.max():.1f}")
 all_coords_norm = (cc - np.array(coord_mean)) / np.array(coord_std)
 all_coords_norm_jax = jnp.array(all_coords_norm)
 
-# Sampler plusieurs latents
-n_samples = 30
+# Fix #11: Increase samples from 30 to 100 for better uncertainty quantification
+n_samples = 100
 ilr_samples = []
 
 for i in range(n_samples):
@@ -461,10 +527,10 @@ for i in range(n_samples):
     std = jnp.exp(0.5 * log_var)
     eps = random.normal(sample_rng, mu.shape)
     z = mu + std * eps
-    
+
     def predict_ilr(coord):
         return dec_ilr.apply(params['dec_ilr'], z, coord)
-    
+
     ilr_sample = vmap(predict_ilr)(all_coords_norm_jax)
     ilr_samples.append(np.array(ilr_sample))
 
@@ -482,6 +548,41 @@ Cu_pred = comp_pred[:, 0]
 
 print(f"Cu prédit: {Cu_pred.min()*100:.2f}% – {Cu_pred.max()*100:.2f}%")
 print(f"Cu vrai:   {Cu.min()*100:.2f}% – {Cu.max()*100:.2f}%")
+
+# %% [markdown]
+# ## Métriques de validation (Fix #8)
+
+# %%
+# Predict ILR at borehole locations using the mean latent
+def predict_ilr_at_coords(mu_latent, coords_norm):
+    def predict(coord):
+        return dec_ilr.apply(params['dec_ilr'], mu_latent, coord)
+    return vmap(predict)(coords_norm)
+
+# Training metrics
+train_ilr_pred = predict_ilr_at_coords(mu, train_coords_norm)
+train_rmse = float(jnp.sqrt(jnp.mean((train_ilr_pred - train_ilr)**2)))
+ss_res_train = float(jnp.sum((train_ilr_pred - train_ilr)**2))
+ss_tot_train = float(jnp.sum((train_ilr - jnp.mean(train_ilr, axis=0))**2))
+train_r2 = 1 - ss_res_train / ss_tot_train
+
+# Validation metrics
+val_ilr_pred = predict_ilr_at_coords(mu, val_coords_norm)
+val_rmse = float(jnp.sqrt(jnp.mean((val_ilr_pred - val_ilr)**2)))
+ss_res_val = float(jnp.sum((val_ilr_pred - val_ilr)**2))
+ss_tot_val = float(jnp.sum((val_ilr - jnp.mean(val_ilr, axis=0))**2))
+val_r2 = 1 - ss_res_val / ss_tot_val
+
+# Susceptibility metrics
+chi_rmse = float(np.sqrt(np.mean((chi_pred_np - susceptibility_true)**2)))
+ss_res_chi = float(np.sum((chi_pred_np - susceptibility_true)**2))
+ss_tot_chi = float(np.sum((susceptibility_true - susceptibility_true.mean())**2))
+chi_r2 = 1 - ss_res_chi / ss_tot_chi
+
+print(f"--- Métriques de validation ---")
+print(f"ILR Train  RMSE: {train_rmse:.4f} | R²: {train_r2:.4f}")
+print(f"ILR Val    RMSE: {val_rmse:.4f} | R²: {val_r2:.4f}")
+print(f"χ global   RMSE: {chi_rmse:.6f} | R²: {chi_r2:.4f}")
 
 # %% [markdown]
 # ---
@@ -502,13 +603,16 @@ df_results = pd.DataFrame({
     'uncertainty': ilr_std[idx_slice, 0]
 })
 
-df_holes = df_forages.drop_duplicates('hole')[['x', 'y']]
+# Fix #8: Distinguish train vs validation boreholes on plots
+df_holes_train = df_train.drop_duplicates('hole')[['x', 'y']]
+df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 
 # %%
 (
     lp.ggplot(df_results)
     + lp.geom_tile(mapping= lp.aes('x', 'y', fill='chi_pred'))
-    + lp.geom_point(data=df_holes, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
     + lp.scale_fill_gradient(low='white', high='darkblue', name='χ (SI)')
     + lp.labs(title=f'Susceptibilité prédite (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
@@ -517,7 +621,8 @@ df_holes = df_forages.drop_duplicates('hole')[['x', 'y']]
 (
     lp.ggplot(df_results, lp.aes('x', 'y'))
     + lp.geom_tile(mapping=lp.aes(fill='chi_true'))
-    + lp.geom_point(data=df_holes, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
     + lp.scale_fill_gradient(low='white', high='darkblue', name='χ (SI)')
     + lp.labs(title=f'Susceptibilité vraie (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
@@ -526,7 +631,8 @@ df_holes = df_forages.drop_duplicates('hole')[['x', 'y']]
 (
     lp.ggplot(df_results, lp.aes('x', 'y'))
     + lp.geom_tile(mapping=lp.aes(fill='Cu_pred'))
-    + lp.geom_point(data=df_holes, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
     + lp.scale_fill_gradient(low='white', high='darkred', name='Cu %')
     + lp.labs(title=f'Cu prédit (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
@@ -535,7 +641,8 @@ df_holes = df_forages.drop_duplicates('hole')[['x', 'y']]
 (
     lp.ggplot(df_results, lp.aes('x', 'y', fill='Cu_true'))
     + lp.geom_tile()
-    + lp.geom_point(data=df_holes, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
     + lp.scale_fill_gradient(low='white', high='darkred', name='Cu %')
     + lp.labs(title=f'Cu vrai (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
@@ -544,7 +651,8 @@ df_holes = df_forages.drop_duplicates('hole')[['x', 'y']]
 (
     lp.ggplot(df_results, lp.aes('x', 'y'))
     + lp.geom_tile(mapping=lp.aes(fill='uncertainty'))
-    + lp.geom_point(data=df_holes, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
     + lp.scale_fill_gradient(low='white', high='purple', name='σ')
     + lp.labs(title=f'Incertitude sur ILR[0] (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
@@ -577,29 +685,26 @@ df_holes = df_forages.drop_duplicates('hole')[['x', 'y']]
 # 1. **SimPEG** pour générer des données magnétiques réalistes
 # 2. **ILR** pour transformer les compositions (fermeture respectée)
 # 3. **Encodeur-décodeur avec PINN**:
-#    - Encoder: magnétique → latent
-#    - Decoder susceptibilité: latent → χ 3D
-#    - Decoder ILR: latent + (x,y,z) → compositions
-#    - Forward JAX: χ → magnétique prédit
+#    - Encoder CNN: magnétique 2D → latent (préserve la structure spatiale)
+#    - Decoder susceptibilité: latent → χ 3D (couches larges + softplus)
+#    - Decoder ILR: latent + Fourier(x,y,z) → compositions
+#    - Forward exact: χ → magnétique prédit via matrice G de SimPEG
 #    - Loss physique: ||mag_prédit - mag_observé||²
-# 4. **Incertitude** par sampling du latent
+#    - Régularisation spatiale: lissage par différences finies
+# 4. **Incertitude** par sampling du latent (100 échantillons)
+# 5. **Validation** sur forages retenus (DH4, DH7) avec RMSE et R²
 #
-# ## Ce qui marche
+# ## Améliorations apportées
 #
-# - La contrainte physique (PINN) force la susceptibilité à être cohérente
-# - L'architecture apprend à combiner les deux sources d'information
-# - L'incertitude reflète (partiellement) notre ignorance
-#
-# ## Limites
-#
-# - Forward simplifié (pas exact comme SimPEG)
-# - Peu de données → généralisation limitée
-# - Pas de multi-physique (EM, gravité)
-#
-# ## Pour Marco
-#
-# "J'ai implémenté un encodeur-décodeur avec régularisation physique pour 
-# l'inversion magnétique. Le PINN force la cohérence entre la géologie 
-# inférée et les observations de surface. L'incertitude vient du sampling 
-# du latent. Je n'ai pas utilisé de GP car le problème est une inversion 
-# contrainte par la physique, pas une interpolation spatiale."
+# 1. Forward model exact (matrice G de SimPEG au lieu d'approximation dipôle)
+# 2. Régularisation spatiale (smoothness loss par différences finies)
+# 3. CNN encoder (préserve structure spatiale 2D)
+# 4. Decoder susceptibilité élargi (256→512→1024)
+# 5. Softplus au lieu de exp*0.01 pour la susceptibilité
+# 6. Fourier features pour le décodeur ILR (contre le biais spectral)
+# 7. Bruit reproductible (numpy RNG seedé)
+# 8. Validation train/test avec métriques (RMSE, R²)
+# 9. KL annealing (linéaire sur 500 epochs → 0.01)
+# 10. Learning rate schedule (warmup cosine decay)
+# 11. 100 échantillons pour l'incertitude (au lieu de 30)
+# 12. Bruit réaliste sur les données de forages (5% relatif)
