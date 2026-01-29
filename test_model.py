@@ -1,6 +1,14 @@
 """
-Test v3: Properly scaled regularization losses + chi_local input to ILR decoder.
-Key insight: chi values are O(0.01), so raw MSE is O(0.0001) — need to normalize.
+Test v8: Boost reconstruction loss weight.
+
+Best results so far: v3/v6 with Cu corr=0.54, Cu R²=-0.37/-0.84.
+The bottleneck is chi spatial accuracy (R²=0.26 at best).
+
+Idea: Increase reconstruction weight (lambda_recon=5) so the model prioritizes
+matching borehole compositions. This creates stronger gradients for chi to
+arrange itself correctly at borehole locations, improving spatial accuracy.
+
+Also try: original v3 regularization (stronger = better for smooth Gaussian blobs).
 """
 import numpy as np
 import pandas as pd
@@ -46,8 +54,6 @@ def ilr_inverse(ilr):
     comp = np.exp(ilr @ V_helmert)
     return comp / comp.sum(axis=1, keepdims=True)
 
-ilr_true = ilr_transform(compositions)
-
 n_stations = 12
 sx = np.linspace(300, nx*dx-300, n_stations)
 sy = np.linspace(300, ny*dy-300, n_stations)
@@ -69,7 +75,6 @@ G_jax = jnp.array(sim.G)
 def forward_magnetic_jax(susceptibility):
     return G_jax @ susceptibility
 
-# Boreholes
 hole_xy = [
     (1500, 1500), (2800, 2500), (500, 500), (2000, 2000), (3500, 1000),
     (1200, 1800), (2500, 2200), (1800, 2800), (3000, 1500), (800, 2500)
@@ -96,7 +101,8 @@ df_train = df[~df['is_validation']].reset_index(drop=True)
 df_val = df[df['is_validation']].reset_index(drop=True)
 print(f"Train: {len(df_train)} | Val: {len(df_val)}")
 
-print("=== Model ===")
+CHI_NORM = 0.01
+CHI_REF = 0.001
 
 class Encoder(nn.Module):
     latent_dim: int = 16
@@ -130,8 +136,7 @@ class DecoderSusceptibility(nn.Module):
 class DecoderILR(nn.Module):
     @nn.compact
     def __call__(self, latent, coord_norm, chi_local):
-        # Normalize chi_local to O(1) so network sees a meaningful feature
-        chi_normalized = chi_local / 0.01
+        chi_normalized = chi_local / CHI_NORM
         x = jnp.concatenate([latent, jnp.atleast_1d(chi_normalized), coord_norm])
         x = nn.Dense(64)(x)
         x = nn.relu(x)
@@ -139,26 +144,21 @@ class DecoderILR(nn.Module):
         x = nn.relu(x)
         return nn.Dense(3)(x)
 
-CHI_NORM = 0.01  # chi scale for normalization
-CHI_REF = 0.001  # background susceptibility
-
 def smoothness_loss(chi, nx, ny, nz):
-    """Normalized smoothness: operate on chi/chi_norm so loss is O(1)."""
     chi_n = chi / CHI_NORM
     chi_3d = chi_n.reshape(nz, ny, nx)
-    dx = jnp.sum((chi_3d[:, :, 1:] - chi_3d[:, :, :-1])**2)
-    dy = jnp.sum((chi_3d[:, 1:, :] - chi_3d[:, :-1, :])**2)
-    dz = jnp.sum((chi_3d[1:, :, :] - chi_3d[:-1, :, :])**2)
-    return (dx + dy + dz) / chi.size
+    ddx = jnp.sum((chi_3d[:, :, 1:] - chi_3d[:, :, :-1])**2)
+    ddy = jnp.sum((chi_3d[:, 1:, :] - chi_3d[:, :-1, :])**2)
+    ddz = jnp.sum((chi_3d[1:, :, :] - chi_3d[:-1, :, :])**2)
+    return (ddx + ddy + ddz) / chi.size
 
 def smallness_loss(chi):
-    """Normalized smallness: penalize deviation from background."""
     return jnp.mean(((chi - CHI_REF) / CHI_NORM)**2)
 
 def loss_fn(params, encoder, dec_susc, dec_ilr,
             mag_grid, mag_observed,
             train_coords_norm, train_ilr, train_cell_idx,
-            rng_key, lambda_physics, lambda_kl,
+            rng_key, lambda_recon, lambda_physics, lambda_kl,
             lambda_smooth, lambda_small):
     mu, log_var = encoder.apply(params['encoder'], mag_grid)
     std = jnp.exp(0.5 * log_var)
@@ -167,14 +167,10 @@ def loss_fn(params, encoder, dec_susc, dec_ilr,
     chi_pred = dec_susc.apply(params['dec_susc'], z)
     mag_pred = forward_magnetic_jax(chi_pred)
 
-    # Physics: normalized by data variance
     loss_physics = jnp.mean((mag_pred - mag_observed)**2) / jnp.var(mag_observed)
-
-    # Regularization: properly scaled to O(1)
     loss_smooth = smoothness_loss(chi_pred, nx, ny, nz)
     loss_small = smallness_loss(chi_pred)
 
-    # Reconstruction at boreholes: chi_local feeds into ILR decoder
     chi_at_train = chi_pred[train_cell_idx]
     def predict_ilr(coord, chi_local):
         return dec_ilr.apply(params['dec_ilr'], z, coord, chi_local)
@@ -183,7 +179,8 @@ def loss_fn(params, encoder, dec_susc, dec_ilr,
 
     loss_kl = -0.5 * jnp.mean(1 + log_var - mu**2 - jnp.exp(log_var))
 
-    loss_total = (loss_recon + lambda_kl * loss_kl + lambda_physics * loss_physics
+    loss_total = (lambda_recon * loss_recon + lambda_kl * loss_kl
+                  + lambda_physics * loss_physics
                   + lambda_smooth * loss_smooth + lambda_small * loss_small)
 
     return loss_total, {
@@ -219,10 +216,13 @@ val_coords_norm = jnp.array((df_val[['x', 'y', 'z']].values - np.array(coord_mea
 val_ilr = jnp.array(df_val[['ilr0', 'ilr1', 'ilr2']].values)
 val_cell_idx = jnp.array(df_val['cell_idx'].values, dtype=jnp.int32)
 
-print("=== Training (5000 epochs) ===")
-n_epochs = 5000
+# v3 config with lambda_recon=5 and 8000 epochs
+print("=== Training v8 (8000 epochs) ===")
+print("lambda_recon=5.0, lambda_physics=1.0, lambda_smooth=0.1, lambda_small=0.05")
+
+n_epochs = 8000
 schedule = optax.warmup_cosine_decay_schedule(
-    init_value=1e-4, peak_value=1e-3, warmup_steps=200, decay_steps=n_epochs
+    init_value=1e-4, peak_value=1e-3, warmup_steps=300, decay_steps=n_epochs
 )
 optimizer = optax.adam(schedule)
 opt_state = optimizer.init(params)
@@ -237,10 +237,11 @@ def train_step(params, opt_state, rng_key, lambda_kl):
         mag_grid_norm, mag_obs_jax,
         train_coords_norm, train_ilr, train_cell_idx,
         rng_key,
+        lambda_recon=5.0,
         lambda_physics=1.0,
         lambda_kl=lambda_kl,
-        lambda_smooth=0.1,   # now properly scaled — this is meaningful
-        lambda_small=0.05    # penalize deviation from background
+        lambda_smooth=0.1,
+        lambda_small=0.05
     )
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
@@ -250,8 +251,8 @@ for epoch in range(n_epochs):
     rng, step_rng = random.split(rng)
     lkl = jnp.float32(min(epoch / kl_warmup, 1.0) * kl_target)
     params, opt_state, loss, aux = train_step(params, opt_state, step_rng, lkl)
-    if epoch % 500 == 0:
-        print(f"Epoch {epoch:4d} | loss={aux['total']:.4f} | recon={aux['recon']:.4f} | "
+    if epoch % 1000 == 0:
+        print(f"Epoch {epoch:5d} | total={aux['total']:.4f} | recon={aux['recon']:.4f} | "
               f"phys={aux['physics']:.4f} | smooth={aux['smooth']:.4f} | "
               f"small={aux['small']:.4f} | χ_max={aux['chi_max']:.4f}")
 
@@ -261,7 +262,6 @@ chi_pred = dec_susc.apply(params['dec_susc'], mu)
 chi_pred_np = np.array(chi_pred)
 
 all_coords_norm = jnp.array((cc - np.array(coord_mean)) / np.array(coord_std))
-
 def predict_all(coord, chi_local):
     return dec_ilr.apply(params['dec_ilr'], mu, coord, chi_local)
 ilr_pred_all = np.array(vmap(predict_all)(all_coords_norm, chi_pred))
@@ -277,11 +277,11 @@ chi_r2 = r2(susceptibility_true, chi_pred_np)
 cu_r2 = r2(Cu, Cu_pred)
 cu_corr = np.corrcoef(Cu, Cu_pred)[0, 1]
 
-chi_val = chi_pred[val_cell_idx]
-val_pred = np.array(vmap(predict_all)(val_coords_norm, chi_val))
+chi_at_val = chi_pred[val_cell_idx]
+val_pred = np.array(vmap(predict_all)(val_coords_norm, chi_at_val))
 val_rmse = float(np.sqrt(np.mean((val_pred - np.array(val_ilr))**2)))
-chi_train = chi_pred[train_cell_idx]
-tr_pred = np.array(vmap(predict_all)(train_coords_norm, chi_train))
+chi_at_train = chi_pred[train_cell_idx]
+tr_pred = np.array(vmap(predict_all)(train_coords_norm, chi_at_train))
 tr_rmse = float(np.sqrt(np.mean((tr_pred - np.array(train_ilr))**2)))
 
 print(f"χ pred: {chi_pred_np.min():.4f} – {chi_pred_np.max():.4f} (true: {susceptibility_true.min():.4f} – {susceptibility_true.max():.4f})")
@@ -293,7 +293,9 @@ print(f"Cu correlation: {cu_corr:.4f}")
 print(f"ILR train RMSE: {tr_rmse:.4f}")
 print(f"ILR val RMSE:   {val_rmse:.4f}")
 
-if cu_corr > 0.5 and chi_r2 > -1:
-    print("\n✓ Model produces meaningful predictions")
+if cu_r2 > 0.0 and cu_corr > 0.6:
+    print("\n>>> GOOD: Cu R² positive and correlation > 0.6")
+elif cu_corr > 0.5:
+    print(f"\n>>> DECENT: correlation > 0.5 but Cu R² = {cu_r2:.4f}")
 else:
-    print(f"\n✗ Still needs work")
+    print(f"\n>>> NEEDS WORK")
