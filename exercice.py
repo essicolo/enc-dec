@@ -1,41 +1,63 @@
 # %% [markdown]
-# # Inversion géophysique avec encodeur-décodeur et PINN
+# # Multi-Sensor Geophysical Inversion with Encoder-Decoder PINN
 #
-# ## Le problème
+# ## Exploration Scenario
 #
-# On a des mesures magnétiques en surface et quelques forages.
-# On veut prédire les compositions (Cu, Ni, Co) partout en 3D.
+# A Cu-Ni-Co sulfide exploration program over a 4km × 4km area.
+# Multiple data sources are integrated through a shared latent space
+# for joint inversion — inspired by KoBold Metals' multi-sensor approach.
 #
-# ## L'architecture
+# ### Data Sources
+#
+# | Sensor              | Type            | Coverage          | Physics             |
+# |---------------------|-----------------|-------------------|---------------------|
+# | Airborne magnetics  | Geophysical     | 20×20 grid, z=80m | TMI → susceptibility|
+# | Ground gravity      | Geophysical     | 20×20 grid, z=1m  | gz → density        |
+# | Hyperspectral drone | Remote sensing  | 16×16×10 bands    | Reflectance spectra |
+# | Soil geochemistry   | Geochemical     | 50 samples → grid | Cu,Ni,Co,Fe,S       |
+# | Drill holes         | Direct sampling | 10 holes, 8 each  | Cu,Ni,Co assays     |
+#
+# ### Architecture
 #
 # ```
-#                              ┌─────────────┐
-#     Magnétique 2D ──────────▶│   ENCODER   │──────▶ Latent z
-#                              └─────────────┘           │
-#                                                        │
-#                    ┌───────────────────────────────────┼───────────────────────┐
-#                    │                                   │                       │
-#                    ▼                                   ▼                       │
-#           ┌────────────────┐                  ┌────────────────┐               │
-#           │ DECODER_SUSC   │                  │  DECODER_ILR   │               │
-#           │ latent → χ(3D) │                  │ latent+χ_local │               │
-#           └────────────────┘                  │ +(x,y,z)→ ILR │               │
-#                    │                          └────────────────┘               │
-#                    │  ┌──────────────────────────────┘│                       │
-#                    │  │ χ at borehole locations       │                       │
-#                    ▼  ▼                               ▼                       │
-#           ┌────────────────┐                   Loss reconstruction            │
-#           │ FORWARD MODEL  │                   (vs forages)                   │
-#           │  (physique)    │                                                  │
-#           └────────────────┘                                                  │
-#                    │                                                          │
-#                    ▼                                                          │
-#             Loss physique ◀───────────────────────────────────────────────────┘
-#             (vs magnétique observé)
+#                ┌──────────────┐
+# Magnetics ────▶│ CNN Branch 1 │──┐
+#                └──────────────┘  │
+#                ┌──────────────┐  │    ┌─────────┐
+# Gravity ──────▶│ CNN Branch 2 │──┼───▶│ FUSION  │──▶ Latent z
+#                └──────────────┘  │    │  MLP    │       │
+#                ┌──────────────┐  │    └─────────┘       │
+# Hyperspectral ▶│ CNN Branch 3 │──┤                      │
+#  (10 bands)    └──────────────┘  │                      │
+#                ┌──────────────┐  │          ┌───────────┴───────────┐
+# Geochemistry ─▶│ CNN Branch 4 │──┘          │                       │
+#  (gridded)     └──────────────┘             ▼                       ▼
+#                                    ┌────────────────┐     ┌────────────────┐
+#                                    │  DECODER_SUSC  │     │ DECODER_DENSITY│
+#                                    │ latent → χ(3D) │     │ latent → Δρ(3D)│
+#                                    └───────┬────────┘     └───────┬────────┘
+#                                            │  ┌───────────────────┘
+#                                            ▼  ▼
+#                                    ┌────────────────┐
+#                                    │  DECODER_ILR   │
+#                                    │ z + χ + Δρ +   │
+#                                    │ (x,y,z) → ILR  │
+#                                    └───────┬────────┘
+#                                            │
+#                  ┌─────────────────────────┼──────────────────────────┐
+#                  │                         │                          │
+#                  ▼                         ▼                          ▼
+#          ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+#          │ FORWARD MAG  │         │ FORWARD GRAV │         │Loss reconstr.│
+#          │  G_mag @ χ   │         │  G_grav @ Δρ │         │(vs boreholes)│
+#          └──────┬───────┘         └──────┬───────┘         └──────────────┘
+#                 ▼                        ▼
+#          Loss magnetics           Loss gravity
 # ```
 #
-# Le PINN = la loss physique force la cohérence avec les observations.
-# Le lien chi → ILR decoder force la cohérence physique-compositions.
+# **Joint inversion**: the shared latent space forces consistency between
+# magnetic susceptibility, density contrast, and mineral compositions.
+# Physics-informed losses ensure predictions honor observed geophysical data.
 
 # %% [markdown]
 # ## Setup
@@ -48,20 +70,21 @@ import jax.numpy as jnp
 from jax import random, grad, jit, vmap
 import flax.linen as nn
 import optax
+from scipy.interpolate import griddata
 
 import lets_plot as lp
 lp.LetsPlot.setup_html()
 
 # %% [markdown]
 # ---
-# # Partie 1: Données synthétiques
+# # Part 1: Synthetic Ground Truth
 
 # %%
 from simpeg import maps
-from simpeg.potential_fields import magnetics
+from simpeg.potential_fields import magnetics, gravity
 from discretize import TensorMesh
 
-# Mesh
+# 3D mesh: 4km × 4km × 1km deep
 nx, ny, nz = 16, 16, 8
 dx, dy, dz = 250, 250, 125
 mesh = TensorMesh(
@@ -71,35 +94,39 @@ mesh = TensorMesh(
 n_cells = mesh.nC
 cc = mesh.cell_centers
 
-print(f"Domaine: {nx*dx}m × {ny*dy}m × {nz*dz}m")
-print(f"Cellules: {n_cells}")
+print(f"Domain: {nx*dx}m × {ny*dy}m × {nz*dz}m")
+print(f"Cells: {n_cells}")
 
 # %%
-# Deux corps minéralisés
+# Two mineralized bodies: Cu-Ni sulfide lenses
 d1 = np.sqrt(((cc[:,0]-1500)/400)**2 + ((cc[:,1]-1500)/350)**2 + ((cc[:,2]+500)/150)**2)
 body1 = np.exp(-d1**2 * 2)
 
 d2 = np.sqrt(((cc[:,0]-2800)/350)**2 + ((cc[:,1]-2500)/300)**2 + ((cc[:,2]+700)/120)**2)
 body2 = np.exp(-d2**2 * 2)
 
-# Susceptibilité
+# Magnetic susceptibility (SI) — sulfides are moderately magnetic
 susceptibility_true = 0.001 + body1 * 0.05 + body2 * 0.02
 
-# Compositions
+# Density contrast (g/cc) — massive sulfides are denser than host rock
+density_true = 0.0 + body1 * 0.5 + body2 * 0.3
+
+# Mineral compositions (mass fractions)
 Cu = 0.005 + body1 * 0.02 + body2 * 0.01
 Ni = 0.003 + body1 * 0.01 + body2 * 0.025
 Co = 0.001 + body1 * 0.005 + body2 * 0.012
 gangue = 1 - Cu - Ni - Co
 compositions = np.stack([Cu, Ni, Co, gangue], axis=1)
 
-print(f"χ: {susceptibility_true.min():.4f} – {susceptibility_true.max():.4f}")
+print(f"χ:  {susceptibility_true.min():.4f} – {susceptibility_true.max():.4f} SI")
+print(f"Δρ: {density_true.min():.2f} – {density_true.max():.2f} g/cc")
 print(f"Cu: {Cu.min()*100:.2f}% – {Cu.max()*100:.2f}%")
 
 # %% [markdown]
-# ## ILR transform
+# ## ILR Transform
 
 # %%
-# Matrice de contraste pour ILR (Helmert) — shared across forward/inverse
+# Helmert contrast matrix for ILR (isometric log-ratio)
 V_helmert = np.array([
     [np.sqrt(3/4), -1/np.sqrt(12), -1/np.sqrt(12), -1/np.sqrt(12)],
     [0, np.sqrt(2/3), -1/np.sqrt(6), -1/np.sqrt(6)],
@@ -118,71 +145,215 @@ def ilr_inverse(ilr):
     return comp / comp.sum(axis=1, keepdims=True)
 
 ilr_true = ilr_transform(compositions)
-print(f"ILR: {ilr_true.min():.2f} – {ilr_true.max():.2f}")
+print(f"ILR range: {ilr_true.min():.2f} – {ilr_true.max():.2f}")
 
 # %% [markdown]
-# ## Forward magnétique avec SimPEG
+# ---
+# # Part 2: Multi-Sensor Surveys
+
+# %% [markdown]
+# ## 2a. Airborne Magnetic Survey (TMI)
+#
+# Helicopter-borne magnetometer at 80m flight height.
+# 400 stations on a regular 20×20 grid.
 
 # %%
-# Stations
-n_stations = 12
-sx = np.linspace(300, nx*dx-300, n_stations)
-sy = np.linspace(300, ny*dy-300, n_stations)
-stations = np.array([[x, y, 50] for x in sx for y in sy])
+rng_np = np.random.default_rng(42)
 
-# Survey
-receivers = magnetics.receivers.Point(
-    stations,        # OÙ on mesure
-    components='tmi' # QU'EST-CE qu'on mesure (Total Magnetic Intensity)
+n_stations_mag = 20
+sx_mag = np.linspace(200, nx*dx-200, n_stations_mag)
+sy_mag = np.linspace(200, ny*dy-200, n_stations_mag)
+stations_mag = np.array([[x, y, 80.0] for x in sx_mag for y in sy_mag])
+
+receivers_mag = magnetics.receivers.Point(stations_mag, components='tmi')
+source_mag = magnetics.sources.UniformBackgroundField(
+    receiver_list=[receivers_mag],
+    amplitude=55000, inclination=70, declination=0
 )
+survey_mag = magnetics.Survey(source_mag)
 
-# source: "quel champ magnétique ambiant?"
-source = magnetics.sources.UniformBackgroundField(
-    receiver_list=[receivers],
-    amplitude=55000, # |B| en nT
-    inclination=70, # angle vertical
-    declination=0 # angle horizontal
-)
-survey = magnetics.Survey(source)
-
-# Simulation — store_sensitivities='ram' to access the G matrix
-sim = magnetics.Simulation3DIntegral(
-    mesh=mesh,
-    survey=survey,
+sim_mag = magnetics.Simulation3DIntegral(
+    mesh=mesh, survey=survey_mag,
     chiMap=maps.IdentityMap(mesh),
     active_cells=np.ones(n_cells, dtype=bool),
     store_sensitivities='ram'
 )
 
-# Reproducible noise with seeded numpy RNG
-rng_np = np.random.default_rng(42)
-mag_observed = sim.dpred(susceptibility_true) + rng_np.normal(0, 1.5, len(stations))
+mag_observed = sim_mag.dpred(susceptibility_true) + rng_np.normal(0, 1.5, len(stations_mag))
+G_mag = sim_mag.G
+G_mag_jax = jnp.array(G_mag)
 
-# Extract sensitivity matrix for exact JAX forward model
-# The forward problem is linear: mag = G @ chi
-G_matrix = sim.G
-G_jax = jnp.array(G_matrix)
-
-print(f"Magnétique: {mag_observed.min():.1f} – {mag_observed.max():.1f} nT")
-print(f"Matrice de sensibilité G: {G_matrix.shape}")
+print(f"Magnetic TMI: {mag_observed.min():.1f} – {mag_observed.max():.1f} nT")
+print(f"G_mag shape: {G_mag.shape}")
 
 # %%
-# Visualiser
-df_mag = pd.DataFrame({'x': stations[:,0], 'y': stations[:,1], 'mag': mag_observed})
+df_mag = pd.DataFrame({'x': stations_mag[:,0], 'y': stations_mag[:,1], 'mag': mag_observed})
 (
     lp.ggplot(df_mag, lp.aes('x', 'y', fill='mag'))
     + lp.geom_tile()
     + lp.scale_fill_gradient2(low='blue', mid='white', high='red', midpoint=0)
-    + lp.labs(title='Magnétique observé', x='X (m)', y='Y (m)', fill='nT')
+    + lp.labs(title='Airborne Magnetics (TMI)', x='X (m)', y='Y (m)', fill='nT')
 )
 
 # %% [markdown]
-# ## Forages
+# ## 2b. Ground Gravity Survey (gz)
+#
+# Ground-based gravimeter measuring vertical gravity anomaly.
+# Same horizontal grid, different elevation (z=1m).
 
 # %%
-# Hold out DH4 and DH7 for validation
-# Add realistic assay noise (5% relative)
+stations_grav = np.array([[x, y, 1.0] for x in sx_mag for y in sy_mag])
 
+receivers_grav = gravity.receivers.Point(stations_grav, components='gz')
+source_grav = gravity.sources.SourceField(receiver_list=[receivers_grav])
+survey_grav = gravity.survey.Survey(source_field=source_grav)
+
+sim_grav = gravity.Simulation3DIntegral(
+    mesh=mesh, survey=survey_grav,
+    rhoMap=maps.IdentityMap(mesh),
+    active_cells=np.ones(n_cells, dtype=bool),
+    store_sensitivities='ram'
+)
+
+grav_observed = sim_grav.dpred(density_true) + rng_np.normal(0, 0.02, len(stations_grav))
+G_grav = sim_grav.G
+G_grav_jax = jnp.array(G_grav)
+
+print(f"Gravity gz: {grav_observed.min():.3f} – {grav_observed.max():.3f} mGal")
+print(f"G_grav shape: {G_grav.shape}")
+
+# %%
+df_grav = pd.DataFrame({'x': stations_grav[:,0], 'y': stations_grav[:,1], 'gz': grav_observed})
+(
+    lp.ggplot(df_grav, lp.aes('x', 'y', fill='gz'))
+    + lp.geom_tile()
+    + lp.scale_fill_gradient2(low='blue', mid='white', high='red', midpoint=0)
+    + lp.labs(title='Ground Gravity (gz)', x='X (m)', y='Y (m)', fill='mGal')
+)
+
+# %% [markdown]
+# ## 2c. Hyperspectral Drone Survey
+#
+# Drone-mounted hyperspectral sensor capturing 10 spectral bands
+# from VNIR (0.4 μm) to SWIR (2.5 μm). Alteration minerals around
+# sulfide deposits create diagnostic absorption features.
+
+# %%
+# Surface anomaly model: mineralization halos projected to surface
+# In reality, weathering and supergene enrichment create broader,
+# attenuated surface expressions of deeper deposits.
+surface_xx, surface_yy = np.meshgrid(mesh.cell_centers_x, mesh.cell_centers_y)
+
+d1_surf = np.sqrt(((surface_xx - 1500)/600)**2 + ((surface_yy - 1500)/550)**2)
+body1_surf = np.exp(-d1_surf**2 * 1.5) * 0.4
+
+d2_surf = np.sqrt(((surface_xx - 2800)/550)**2 + ((surface_yy - 2500)/500)**2)
+body2_surf = np.exp(-d2_surf**2 * 1.5) * 0.25
+
+# Spectral endmembers: reflectance profiles for different surface materials
+# Bands span VNIR to SWIR (iron oxides, clays, carbonates, silica)
+n_bands = 10
+endmember_bg = np.array([0.30, 0.32, 0.35, 0.33, 0.30, 0.28, 0.25, 0.27, 0.30, 0.28])
+endmember_fe = np.array([0.15, 0.22, 0.38, 0.55, 0.68, 0.62, 0.48, 0.42, 0.38, 0.33])  # gossan (iron oxide)
+endmember_clay = np.array([0.40, 0.45, 0.50, 0.52, 0.58, 0.50, 0.40, 0.28, 0.18, 0.22]) # clay alteration
+
+# Linear spectral mixing at surface
+frac_fe = body1_surf + 0.5 * body2_surf     # iron oxide fraction
+frac_clay = 0.5 * body1_surf + body2_surf   # clay fraction
+frac_bg = np.clip(1.0 - frac_fe - frac_clay, 0.1, 1.0)
+total = frac_bg + frac_fe + frac_clay
+frac_bg /= total; frac_fe /= total; frac_clay /= total
+
+hyper_image = (frac_bg[:,:,None] * endmember_bg +
+               frac_fe[:,:,None] * endmember_fe +
+               frac_clay[:,:,None] * endmember_clay)
+hyper_image += rng_np.normal(0, 0.02, hyper_image.shape)
+hyper_image = np.clip(hyper_image, 0, 1)
+
+print(f"Hyperspectral image: {hyper_image.shape} (ny × nx × bands)")
+print(f"Reflectance range: {hyper_image.min():.3f} – {hyper_image.max():.3f}")
+
+# %%
+# Show RGB composite (bands 3, 2, 1) and SWIR (bands 8, 6, 4)
+df_hyper_rgb = pd.DataFrame({
+    'x': surface_xx.ravel(), 'y': surface_yy.ravel(),
+    'band_3': hyper_image[:,:,2].ravel()
+})
+(
+    lp.ggplot(df_hyper_rgb, lp.aes('x', 'y', fill='band_3'))
+    + lp.geom_tile()
+    + lp.scale_fill_gradient(low='#1a1a2e', high='#e94560', name='Refl.')
+    + lp.labs(title='Hyperspectral Band 3 (VNIR red)', x='X (m)', y='Y (m)')
+)
+
+# %% [markdown]
+# ## 2d. Surface Geochemistry (Soil Samples)
+#
+# 50 soil samples analyzed for Cu, Ni, Co, Fe, S (ppm or %).
+# Interpolated to a 16×16 grid for the encoder.
+
+# %%
+n_soil = 50
+soil_x = rng_np.uniform(200, nx*dx-200, n_soil)
+soil_y = rng_np.uniform(200, ny*dy-200, n_soil)
+
+# Evaluate surface body intensities at sample locations
+d1_soil = np.sqrt(((soil_x - 1500)/600)**2 + ((soil_y - 1500)/550)**2)
+body1_soil = np.exp(-d1_soil**2 * 1.5) * 0.4
+d2_soil = np.sqrt(((soil_x - 2800)/550)**2 + ((soil_y - 2500)/500)**2)
+body2_soil = np.exp(-d2_soil**2 * 1.5) * 0.25
+
+# Realistic soil geochemistry concentrations with noise
+Cu_soil = 30 + body1_soil * 500 + body2_soil * 300 + rng_np.normal(0, 10, n_soil)  # ppm
+Ni_soil = 20 + body1_soil * 200 + body2_soil * 600 + rng_np.normal(0, 8, n_soil)   # ppm
+Co_soil = 8 + body1_soil * 80 + body2_soil * 200 + rng_np.normal(0, 4, n_soil)     # ppm
+Fe_soil = 3.0 + body1_soil * 5 + body2_soil * 3 + rng_np.normal(0, 0.3, n_soil)    # %
+S_soil = 0.1 + body1_soil * 2 + body2_soil * 1.5 + rng_np.normal(0, 0.05, n_soil)  # %
+Cu_soil = np.clip(Cu_soil, 5, None)
+Ni_soil = np.clip(Ni_soil, 5, None)
+Co_soil = np.clip(Co_soil, 2, None)
+
+df_soil = pd.DataFrame({
+    'x': soil_x, 'y': soil_y,
+    'Cu_ppm': Cu_soil, 'Ni_ppm': Ni_soil, 'Co_ppm': Co_soil,
+    'Fe_pct': Fe_soil, 'S_pct': S_soil
+})
+
+# Interpolate to 16×16 grid for encoder input
+grid_xy = np.column_stack([surface_xx.ravel(), surface_yy.ravel()])
+soil_points = np.column_stack([soil_x, soil_y])
+
+geochem_grid = np.zeros((nx * ny, 5))
+for i, col in enumerate(['Cu_ppm', 'Ni_ppm', 'Co_ppm', 'Fe_pct', 'S_pct']):
+    vals = df_soil[col].values
+    grid_lin = griddata(soil_points, vals, grid_xy, method='linear')
+    grid_near = griddata(soil_points, vals, grid_xy, method='nearest')
+    geochem_grid[:, i] = np.where(np.isnan(grid_lin), grid_near, grid_lin)
+
+# Normalize each channel to [0, 1]
+geochem_min = geochem_grid.min(axis=0)
+geochem_max = geochem_grid.max(axis=0)
+geochem_grid_norm = (geochem_grid - geochem_min) / (geochem_max - geochem_min + 1e-8)
+geochem_grid_2d = geochem_grid_norm.reshape(ny, nx, 5)
+
+print(f"Soil samples: {n_soil}")
+print(f"Geochem grid: {geochem_grid_2d.shape} (ny × nx × elements)")
+
+# %%
+(
+    lp.ggplot(df_soil, lp.aes('x', 'y', color='Cu_ppm'))
+    + lp.geom_point(size=4)
+    + lp.scale_color_gradient(low='lightyellow', high='darkred', name='Cu (ppm)')
+    + lp.labs(title='Soil Geochemistry — Cu', x='X (m)', y='Y (m)')
+)
+
+# %% [markdown]
+# ## 2e. Drill Holes
+#
+# 10 diamond drill holes with Cu, Ni, Co assays at 8 depth intervals.
+# DH4 and DH7 are held out for validation.
+
+# %%
 hole_xy = [
     (1500, 1500), (2800, 2500), (500, 500), (2000, 2000), (3500, 1000),
     (1200, 1800), (2500, 2200), (1800, 2800), (3000, 1500), (800, 2500)
@@ -193,10 +364,10 @@ noise_rel = 0.05  # 5% relative noise on assays
 
 forages = []
 for i, (hx, hy) in enumerate(hole_xy):
-    ix, iy = np.argmin(np.abs(mesh.cell_centers_x - hx)), np.argmin(np.abs(mesh.cell_centers_y - hy))
+    ix = np.argmin(np.abs(mesh.cell_centers_x - hx))
+    iy = np.argmin(np.abs(mesh.cell_centers_y - hy))
     for iz in range(nz):
         idx = ix + iy * nx + iz * nx * ny
-        # Add realistic assay noise
         cu_noisy = max(Cu[idx] * (1 + rng_np.normal(0, noise_rel)), 1e-6)
         ni_noisy = max(Ni[idx] * (1 + rng_np.normal(0, noise_rel)), 1e-6)
         co_noisy = max(Co[idx] * (1 + rng_np.normal(0, noise_rel)), 1e-6)
@@ -206,7 +377,8 @@ for i, (hx, hy) in enumerate(hole_xy):
 
         hole_name = f'DH{i+1}'
         forages.append({
-            'hole': hole_name, 'x': mesh.cell_centers_x[ix], 'y': mesh.cell_centers_y[iy],
+            'hole': hole_name,
+            'x': mesh.cell_centers_x[ix], 'y': mesh.cell_centers_y[iy],
             'z': mesh.cell_centers_z[iz],
             'Cu': cu_noisy, 'Ni': ni_noisy, 'Co': co_noisy,
             'ilr0': ilr_noisy[0], 'ilr1': ilr_noisy[1], 'ilr2': ilr_noisy[2],
@@ -218,62 +390,109 @@ df_forages = pd.DataFrame(forages)
 df_train = df_forages[~df_forages['is_validation']].reset_index(drop=True)
 df_val = df_forages[df_forages['is_validation']].reset_index(drop=True)
 
-print(f"Échantillons total: {len(df_forages)} | train: {len(df_train)} | validation: {len(df_val)}")
+print(f"Drill samples: {len(df_forages)} | train: {len(df_train)} | val: {len(df_val)}")
 
 # %% [markdown]
 # ---
-# # Partie 2: Forward model différentiable en JAX
+# # Part 3: Differentiable Forward Models (JAX)
 #
-# On utilise la matrice de sensibilité G de SimPEG plutôt qu'une
-# approximation dipôle. Le problème forward étant linéaire (mag = G @ χ),
-# c'est exact et directement différentiable en JAX.
+# Both forward problems are linear, so we use the sensitivity matrices
+# extracted from SimPEG for exact, differentiable forward modeling.
 
 # %%
 @jit
 def forward_magnetic_jax(susceptibility):
-    """Forward magnétique exact via la matrice de sensibilité G de SimPEG."""
-    return G_jax @ susceptibility
+    """Forward magnetics: TMI = G_mag @ χ"""
+    return G_mag_jax @ susceptibility
 
-# Test
+@jit
+def forward_gravity_jax(density):
+    """Forward gravity: gz = G_grav @ Δρ"""
+    return G_grav_jax @ density
+
+# Verify forward models
 mag_test = forward_magnetic_jax(jnp.array(susceptibility_true))
-print(f"Forward JAX (G matrix): {float(mag_test.min()):.1f} – {float(mag_test.max()):.1f}")
-print(f"SimPEG dpred:           {mag_observed.min():.1f} – {mag_observed.max():.1f}")
+grav_test = forward_gravity_jax(jnp.array(density_true))
+print(f"Forward magnetics: {float(mag_test.min()):.1f} – {float(mag_test.max()):.1f} nT")
+print(f"Forward gravity:   {float(grav_test.min()):.4f} – {float(grav_test.max()):.4f} mGal")
 
 # %% [markdown]
 # ---
-# # Partie 3: Architecture du réseau
+# # Part 4: Network Architecture
+#
+# Multi-modal encoder with separate branches for each sensor,
+# fused through a shared MLP into a single latent space.
+# Two physical property decoders + one composition decoder.
 
 # %%
-# Normalization constants for susceptibility regularization
-# Chi values are O(0.01), so squared losses are O(0.0001) without normalization.
-# Dividing by CHI_NORM before computing MSE brings losses to O(1).
-CHI_NORM = 0.01   # characteristic susceptibility scale
-CHI_REF = 0.001   # background susceptibility for smallness penalty
+# Normalization constants — bring regularization losses to O(1)
+CHI_NORM = 0.01    # susceptibility characteristic scale
+CHI_REF = 0.001    # background susceptibility
+RHO_NORM = 0.1     # density contrast characteristic scale
+RHO_REF = 0.0      # background density contrast
 
 # %%
-# CNN encoder to preserve spatial structure of the magnetic grid
-class Encoder(nn.Module):
-    """Magnétique 2D → distribution sur le latent (CNN)"""
-    latent_dim: int = 16
+class MultiModalEncoder(nn.Module):
+    """
+    Fuses magnetic, gravity, hyperspectral, and geochemistry inputs
+    into a shared latent distribution (VAE-style).
+    """
+    latent_dim: int = 32
 
     @nn.compact
-    def __call__(self, mag_grid):
-        x = mag_grid[jnp.newaxis, :, :, jnp.newaxis]  # (1, 12, 12, 1)
-        x = nn.Conv(16, kernel_size=(3, 3), padding='SAME')(x)
-        x = nn.relu(x)
-        x = nn.Conv(32, kernel_size=(3, 3), padding='SAME')(x)
-        x = nn.relu(x)
-        x = x.ravel()
-        x = nn.Dense(64)(x)
-        x = nn.relu(x)
-        mu = nn.Dense(self.latent_dim)(x)
-        log_var = nn.Dense(self.latent_dim)(x)
+    def __call__(self, mag_grid, grav_grid, hyper_img, geochem_grid):
+        # --- Magnetic branch: (20, 20) → 64 features ---
+        m = mag_grid[jnp.newaxis, :, :, jnp.newaxis]
+        m = nn.Conv(16, kernel_size=(3, 3), padding='SAME')(m)
+        m = nn.relu(m)
+        m = nn.Conv(32, kernel_size=(3, 3), padding='SAME')(m)
+        m = nn.relu(m)
+        m = m.ravel()
+        m = nn.Dense(64)(m)
+        m = nn.relu(m)
+
+        # --- Gravity branch: (20, 20) → 64 features ---
+        g = grav_grid[jnp.newaxis, :, :, jnp.newaxis]
+        g = nn.Conv(16, kernel_size=(3, 3), padding='SAME')(g)
+        g = nn.relu(g)
+        g = nn.Conv(32, kernel_size=(3, 3), padding='SAME')(g)
+        g = nn.relu(g)
+        g = g.ravel()
+        g = nn.Dense(64)(g)
+        g = nn.relu(g)
+
+        # --- Hyperspectral branch: (16, 16, 10) → 64 features ---
+        h = hyper_img[jnp.newaxis, :, :, :]
+        h = nn.Conv(16, kernel_size=(3, 3), padding='SAME')(h)
+        h = nn.relu(h)
+        h = nn.Conv(32, kernel_size=(3, 3), padding='SAME')(h)
+        h = nn.relu(h)
+        h = h.ravel()
+        h = nn.Dense(64)(h)
+        h = nn.relu(h)
+
+        # --- Geochemistry branch: (16, 16, 5) → 32 features ---
+        c = geochem_grid[jnp.newaxis, :, :, :]
+        c = nn.Conv(16, kernel_size=(3, 3), padding='SAME')(c)
+        c = nn.relu(c)
+        c = c.ravel()
+        c = nn.Dense(32)(c)
+        c = nn.relu(c)
+
+        # --- Fusion MLP ---
+        fused = jnp.concatenate([m, g, h, c])  # 64+64+64+32 = 224
+        fused = nn.Dense(128)(fused)
+        fused = nn.relu(fused)
+        fused = nn.Dense(64)(fused)
+        fused = nn.relu(fused)
+
+        mu = nn.Dense(self.latent_dim)(fused)
+        log_var = nn.Dense(self.latent_dim)(fused)
         return mu, log_var
 
 
-# Wider decoder layers with softplus scaling
 class DecoderSusceptibility(nn.Module):
-    """Latent → susceptibilité 3D (une valeur par cellule)"""
+    """Latent → magnetic susceptibility χ (positive, 3D field)"""
     n_cells: int
 
     @nn.compact
@@ -285,21 +504,38 @@ class DecoderSusceptibility(nn.Module):
         x = nn.Dense(512)(x)
         x = nn.relu(x)
         raw = nn.Dense(self.n_cells)(x)
-        # softplus for numerically stable positive output
         return nn.softplus(raw) * 0.01
 
 
-# KEY FIX: DecoderILR now receives chi_local — the predicted susceptibility
-# at each location. This creates a direct information bridge from the
-# physics-constrained susceptibility to composition predictions.
-class DecoderILR(nn.Module):
-    """Latent + chi_local + coordinates → ILR"""
+class DecoderDensity(nn.Module):
+    """Latent → density contrast Δρ (positive for sulfide ore, 3D field)"""
+    n_cells: int
 
     @nn.compact
-    def __call__(self, latent, coord_norm, chi_local):
-        # Normalize chi_local to O(1) so the network sees a meaningful feature
-        chi_normalized = chi_local / CHI_NORM
-        x = jnp.concatenate([latent, jnp.atleast_1d(chi_normalized), coord_norm])
+    def __call__(self, latent):
+        x = nn.Dense(128)(latent)
+        x = nn.relu(x)
+        x = nn.Dense(256)(x)
+        x = nn.relu(x)
+        x = nn.Dense(512)(x)
+        x = nn.relu(x)
+        raw = nn.Dense(self.n_cells)(x)
+        return nn.softplus(raw) * 0.1
+
+
+class DecoderILR(nn.Module):
+    """
+    Latent + local physical properties + coordinates → ILR compositions.
+    Both chi_local and rho_local provide direct physical bridges from
+    the geophysical inversion to compositional prediction.
+    """
+
+    @nn.compact
+    def __call__(self, latent, coord_norm, chi_local, rho_local):
+        chi_n = chi_local / CHI_NORM
+        rho_n = rho_local / RHO_NORM
+        x = jnp.concatenate([latent, jnp.atleast_1d(chi_n),
+                             jnp.atleast_1d(rho_n), coord_norm])
         x = nn.Dense(64)(x)
         x = nn.relu(x)
         x = nn.Dense(32)(x)
@@ -308,71 +544,71 @@ class DecoderILR(nn.Module):
 
 # %% [markdown]
 # ---
-# # Partie 4: Loss function avec PINN
+# # Part 5: Multi-Physics Loss Function
 
 # %%
-# Spatial smoothness regularization — normalized by CHI_NORM so loss is O(1)
-def smoothness_loss(chi, nx, ny, nz):
-    """Finite-difference smoothness on normalized susceptibility."""
-    chi_n = chi / CHI_NORM
-    chi_3d = chi_n.reshape(nz, ny, nx)
-    diff_x = jnp.sum((chi_3d[:, :, 1:] - chi_3d[:, :, :-1])**2)
-    diff_y = jnp.sum((chi_3d[:, 1:, :] - chi_3d[:, :-1, :])**2)
-    diff_z = jnp.sum((chi_3d[1:, :, :] - chi_3d[:-1, :, :])**2)
-    return (diff_x + diff_y + diff_z) / chi.size
+def smoothness_loss(field, nx, ny, nz, norm):
+    """Finite-difference smoothness on a normalized 3D field."""
+    f = field / norm
+    f3d = f.reshape(nz, ny, nx)
+    dx = jnp.sum((f3d[:, :, 1:] - f3d[:, :, :-1])**2)
+    dy = jnp.sum((f3d[:, 1:, :] - f3d[:, :-1, :])**2)
+    dz = jnp.sum((f3d[1:, :, :] - f3d[:-1, :, :])**2)
+    return (dx + dy + dz) / field.size
 
-def smallness_loss(chi):
-    """Penalize deviation from background susceptibility (normalized)."""
-    return jnp.mean(((chi - CHI_REF) / CHI_NORM)**2)
+def smallness_loss(field, ref, norm):
+    """Penalize deviation from background value (normalized)."""
+    return jnp.mean(((field - ref) / norm)**2)
 
 
-def loss_fn(params, encoder, dec_susc, dec_ilr,
-            mag_grid, mag_observed,
+def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
+            mag_grid, grav_grid, hyper_img, geochem_grid,
+            mag_observed, grav_observed,
             train_coords_norm, train_ilr, train_cell_idx,
-            rng_key, lambda_recon=5.0, lambda_physics=1.0,
+            rng_key,
+            lambda_recon=5.0, lambda_mag=1.0, lambda_grav=1.0,
             lambda_kl=0.01, lambda_smooth=0.1, lambda_small=0.05):
     """
-    Loss totale = λ_recon * reconstruction + KL + physique + smoothness + smallness
-
-    Key design choices:
-    - chi_pred feeds both physics loss AND ILR decoder (chi_local input),
-      so borehole compositions help constrain the susceptibility field.
-    - lambda_recon=5 boosts reconstruction weight so borehole data
-      drives chi spatial accuracy (tested: chi R²=0.38, Cu R²=0.17).
-    - Regularization losses normalized by CHI_NORM so they are O(1).
+    Multi-physics loss:
+    - Magnetic forward: ||G_mag @ χ - mag_obs||² / var(mag_obs)
+    - Gravity forward:  ||G_grav @ Δρ - grav_obs||² / var(grav_obs)
+    - ILR reconstruction at drill holes (with chi + rho inputs)
+    - KL divergence for latent regularization
+    - Smoothness + smallness for both χ and Δρ
     """
 
-    # --- Encoder ---
-    mu, log_var = encoder.apply(params['encoder'], mag_grid)
-
-    # Reparameterization trick
+    # --- Encode ---
+    mu, log_var = encoder.apply(params['encoder'],
+                                mag_grid, grav_grid, hyper_img, geochem_grid)
     std = jnp.exp(0.5 * log_var)
     eps = random.normal(rng_key, mu.shape)
     z = mu + std * eps
 
-    # --- Decoder susceptibilité ---
+    # --- Decode physical properties ---
     chi_pred = dec_susc.apply(params['dec_susc'], z)
+    rho_pred = dec_dens.apply(params['dec_dens'], z)
 
-    # --- Forward model (PINN) — exact G matrix ---
+    # --- Forward models (PINN) ---
     mag_pred = forward_magnetic_jax(chi_pred)
+    grav_pred = forward_gravity_jax(rho_pred)
 
-    # Loss physique: normalized by data variance
-    loss_physics = jnp.mean((mag_pred - mag_observed)**2) / jnp.var(mag_observed)
+    loss_mag = jnp.mean((mag_pred - mag_observed)**2) / jnp.var(mag_observed)
+    loss_grav = jnp.mean((grav_pred - grav_observed)**2) / jnp.var(grav_observed)
 
-    # --- Regularization: properly scaled to O(1) ---
-    loss_smooth = smoothness_loss(chi_pred, nx, ny, nz)
-    loss_small = smallness_loss(chi_pred)
+    # --- Regularization (both fields) ---
+    loss_smooth = (smoothness_loss(chi_pred, nx, ny, nz, CHI_NORM) +
+                   smoothness_loss(rho_pred, nx, ny, nz, RHO_NORM))
+    loss_small = (smallness_loss(chi_pred, CHI_REF, CHI_NORM) +
+                  smallness_loss(rho_pred, RHO_REF, RHO_NORM))
 
-    # --- Decoder ILR — with chi_local input ---
-    # Extract predicted chi at each training borehole location
+    # --- Decode ILR at drill hole locations ---
     chi_at_train = chi_pred[train_cell_idx]
+    rho_at_train = rho_pred[train_cell_idx]
 
-    def predict_ilr(coord, chi_local):
-        return dec_ilr.apply(params['dec_ilr'], z, coord, chi_local)
+    def predict_ilr(coord, chi_local, rho_local):
+        return dec_ilr.apply(params['dec_ilr'], z, coord, chi_local, rho_local)
 
-    ilr_pred = vmap(predict_ilr)(train_coords_norm, chi_at_train)
-
-    # Loss reconstruction ILR
+    ilr_pred = vmap(predict_ilr)(train_coords_norm, chi_at_train, rho_at_train)
     loss_recon = jnp.mean((ilr_pred - train_ilr)**2)
 
     # --- KL divergence ---
@@ -381,66 +617,79 @@ def loss_fn(params, encoder, dec_susc, dec_ilr,
     # --- Total ---
     loss_total = (lambda_recon * loss_recon
                   + lambda_kl * loss_kl
-                  + lambda_physics * loss_physics
+                  + lambda_mag * loss_mag
+                  + lambda_grav * loss_grav
                   + lambda_smooth * loss_smooth
                   + lambda_small * loss_small)
 
     return loss_total, {
         'total': loss_total, 'recon': loss_recon,
-        'kl': loss_kl, 'physics': loss_physics,
+        'kl': loss_kl, 'mag': loss_mag, 'grav': loss_grav,
         'smooth': loss_smooth, 'small': loss_small,
-        'chi_mean': jnp.mean(chi_pred), 'chi_max': jnp.max(chi_pred)
+        'chi_max': jnp.max(chi_pred), 'rho_max': jnp.max(rho_pred)
     }
 
 # %% [markdown]
 # ---
-# # Partie 5: Entraînement
+# # Part 6: Training
 
 # %%
-# Initialiser
+# Initialize all modules
 rng = random.PRNGKey(42)
-rng, *init_rngs = random.split(rng, 4)
+rng, *init_rngs = random.split(rng, 5)
 
-latent_dim = 16  # reduced from 32 to avoid overfitting with 144 measurements
-encoder = Encoder(latent_dim=latent_dim)
+latent_dim = 32
+encoder = MultiModalEncoder(latent_dim=latent_dim)
 dec_susc = DecoderSusceptibility(n_cells=n_cells)
+dec_dens = DecoderDensity(n_cells=n_cells)
 dec_ilr = DecoderILR()
 
-# Dummy inputs
-dummy_mag = jnp.zeros((n_stations, n_stations))
+# Dummy inputs for initialization
+dummy_mag = jnp.zeros((n_stations_mag, n_stations_mag))
+dummy_grav = jnp.zeros((n_stations_mag, n_stations_mag))
+dummy_hyper = jnp.zeros((ny, nx, n_bands))
+dummy_geochem = jnp.zeros((ny, nx, 5))
 dummy_latent = jnp.zeros(latent_dim)
 dummy_coord = jnp.zeros(3)
 dummy_chi = jnp.float32(0.0)
+dummy_rho = jnp.float32(0.0)
 
 params = {
-    'encoder': encoder.init(init_rngs[0], dummy_mag),
+    'encoder': encoder.init(init_rngs[0], dummy_mag, dummy_grav, dummy_hyper, dummy_geochem),
     'dec_susc': dec_susc.init(init_rngs[1], dummy_latent),
-    'dec_ilr': dec_ilr.init(init_rngs[2], dummy_latent, dummy_coord, dummy_chi)
+    'dec_dens': dec_dens.init(init_rngs[2], dummy_latent),
+    'dec_ilr': dec_ilr.init(init_rngs[3], dummy_latent, dummy_coord, dummy_chi, dummy_rho)
 }
 
 # %%
-# Préparer les données — use training set only
-mag_grid = jnp.array(mag_observed.reshape(n_stations, n_stations))
+# Prepare data tensors
+mag_grid = jnp.array(mag_observed.reshape(n_stations_mag, n_stations_mag))
 mag_grid_norm = (mag_grid - mag_grid.mean()) / (mag_grid.std() + 1e-6)
 
-mag_obs_jax = jnp.array(mag_observed)
+grav_grid = jnp.array(grav_observed.reshape(n_stations_mag, n_stations_mag))
+grav_grid_norm = (grav_grid - grav_grid.mean()) / (grav_grid.std() + 1e-6)
 
-# Coordonnées des forages normalisées (training only)
+hyper_img_jax = jnp.array(hyper_image)
+geochem_grid_jax = jnp.array(geochem_grid_2d)
+
+mag_obs_jax = jnp.array(mag_observed)
+grav_obs_jax = jnp.array(grav_observed)
+
+# Drill hole coordinates (normalized)
 coord_mean = jnp.array([nx*dx/2, ny*dy/2, -nz*dz/2])
 coord_std = jnp.array([nx*dx/2, ny*dy/2, nz*dz/2])
 train_coords_norm = jnp.array((df_train[['x', 'y', 'z']].values - np.array(coord_mean)) / np.array(coord_std))
 train_ilr = jnp.array(df_train[['ilr0', 'ilr1', 'ilr2']].values)
 train_cell_idx = jnp.array(df_train['cell_idx'].values, dtype=jnp.int32)
 
-# Validation coordinates
 val_coords_norm = jnp.array((df_val[['x', 'y', 'z']].values - np.array(coord_mean)) / np.array(coord_std))
 val_ilr = jnp.array(df_val[['ilr0', 'ilr1', 'ilr2']].values)
 val_cell_idx = jnp.array(df_val['cell_idx'].values, dtype=jnp.int32)
 
-print(f"Prêt pour l'entraînement")
+print("Data prepared for training")
 
 # %%
-# Learning rate schedule with warmup cosine decay
+# Optimizer with warmup cosine decay
 n_epochs = 8000
 schedule = optax.warmup_cosine_decay_schedule(
     init_value=1e-4,
@@ -451,35 +700,35 @@ schedule = optax.warmup_cosine_decay_schedule(
 optimizer = optax.adam(schedule)
 opt_state = optimizer.init(params)
 
-# KL annealing parameters
+# KL annealing
 kl_warmup_epochs = 1000
 kl_target = 0.01
 
 @jit
 def train_step(params, opt_state, rng_key, lambda_kl):
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-        params, encoder, dec_susc, dec_ilr,
-        mag_grid_norm, mag_obs_jax,
+        params, encoder, dec_susc, dec_dens, dec_ilr,
+        mag_grid_norm, grav_grid_norm, hyper_img_jax, geochem_grid_jax,
+        mag_obs_jax, grav_obs_jax,
         train_coords_norm, train_ilr, train_cell_idx,
         rng_key,
-        lambda_recon=5.0,    # boost reconstruction so boreholes drive chi
-        lambda_physics=1.0,
+        lambda_recon=5.0,
+        lambda_mag=1.0,
+        lambda_grav=1.0,
         lambda_kl=lambda_kl,
-        lambda_smooth=0.1,   # properly scaled — chi normalized to O(1)
-        lambda_small=0.05    # penalize deviation from background
+        lambda_smooth=0.1,
+        lambda_small=0.05
     )
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
     return params, opt_state, loss, aux
 
 # %%
-# Boucle d'entraînement avec KL annealing
+# Training loop
 history = []
 
 for epoch in range(n_epochs):
     rng, step_rng = random.split(rng)
-
-    # KL annealing — linearly increase from 0 to kl_target
     lambda_kl = jnp.float32(min(epoch / kl_warmup_epochs, 1.0) * kl_target)
 
     params, opt_state, loss, aux = train_step(params, opt_state, step_rng, lambda_kl)
@@ -487,53 +736,61 @@ for epoch in range(n_epochs):
 
     if epoch % 1000 == 0:
         print(f"Epoch {epoch:4d} | loss={aux['total']:.4f} | recon={aux['recon']:.4f} | "
-              f"phys={aux['physics']:.4f} | smooth={aux['smooth']:.4f} | "
-              f"small={aux['small']:.4f} | χ_max={aux['chi_max']:.4f}")
+              f"mag={aux['mag']:.4f} | grav={aux['grav']:.4f} | "
+              f"smooth={aux['smooth']:.4f} | χ_max={aux['chi_max']:.4f} | ρ_max={aux['rho_max']:.4f}")
 
 # %%
-# Courbes de loss
+# Training curves
 df_hist = pd.DataFrame(history)
 
 (
     lp.ggplot(df_hist, lp.aes(x='epoch'))
     + lp.geom_line(lp.aes(y='recon'), color="#962561")
-    + lp.geom_line(lp.aes(y='physics'), color="#abc000")
+    + lp.geom_line(lp.aes(y='mag'), color="#abc000")
+    + lp.geom_line(lp.aes(y='grav'), color="#006080")
     + lp.geom_line(lp.aes(y='smooth'), color="#00abc0")
     + lp.geom_line(lp.aes(y='small'), color="#c06000")
     + lp.scale_y_log10()
-    + lp.labs(title='Entraînement', x='Epoch', y='Loss (log)')
+    + lp.labs(title='Training losses', x='Epoch', y='Loss (log)')
 )
 
 # %% [markdown]
 # ---
-# # Partie 6: Prédictions
+# # Part 7: Predictions
 
 # %%
-# Encoder → latent
-mu, log_var = encoder.apply(params['encoder'], mag_grid_norm)
+# Encode → latent (deterministic, using mean)
+mu, log_var = encoder.apply(params['encoder'],
+                            mag_grid_norm, grav_grid_norm,
+                            hyper_img_jax, geochem_grid_jax)
 
-# Décoder la susceptibilité
+# Decode physical properties
 chi_pred = dec_susc.apply(params['dec_susc'], mu)
+rho_pred = dec_dens.apply(params['dec_dens'], mu)
 chi_pred_np = np.array(chi_pred)
+rho_pred_np = np.array(rho_pred)
 
-print(f"χ prédit: {chi_pred_np.min():.4f} – {chi_pred_np.max():.4f}")
-print(f"χ vrai:   {susceptibility_true.min():.4f} – {susceptibility_true.max():.4f}")
+print(f"χ predicted: {chi_pred_np.min():.4f} – {chi_pred_np.max():.4f} SI")
+print(f"χ true:      {susceptibility_true.min():.4f} – {susceptibility_true.max():.4f} SI")
+print(f"Δρ predicted: {rho_pred_np.min():.3f} – {rho_pred_np.max():.3f} g/cc")
+print(f"Δρ true:      {density_true.min():.3f} – {density_true.max():.3f} g/cc")
 
 # %%
-# Vérifier le forward
+# Verify forward models
 mag_from_pred = forward_magnetic_jax(chi_pred)
-print(f"Mag prédit: {float(mag_from_pred.min()):.1f} – {float(mag_from_pred.max()):.1f}")
-print(f"Mag observé: {mag_observed.min():.1f} – {mag_observed.max():.1f}")
+grav_from_pred = forward_gravity_jax(rho_pred)
+print(f"Mag predicted: {float(mag_from_pred.min()):.1f} – {float(mag_from_pred.max()):.1f} nT")
+print(f"Mag observed:  {mag_observed.min():.1f} – {mag_observed.max():.1f} nT")
+print(f"Grav predicted: {float(grav_from_pred.min()):.4f} – {float(grav_from_pred.max()):.4f} mGal")
+print(f"Grav observed:  {grav_observed.min():.4f} – {grav_observed.max():.4f} mGal")
 
 # %% [markdown]
-# ## Prédire les ILR avec incertitude (sampling)
+# ## Predict compositions with uncertainty (posterior sampling)
 
 # %%
-# Grille de prédiction: toutes les cellules
 all_coords_norm = (cc - np.array(coord_mean)) / np.array(coord_std)
 all_coords_norm_jax = jnp.array(all_coords_norm)
 
-# Sample from latent posterior for uncertainty quantification
 n_samples = 100
 ilr_samples = []
 
@@ -543,41 +800,41 @@ for i in range(n_samples):
     eps = random.normal(sample_rng, mu.shape)
     z = mu + std * eps
 
-    # Recompute chi for this latent sample (uncertainty propagates through chi)
     chi_sample = dec_susc.apply(params['dec_susc'], z)
+    rho_sample = dec_dens.apply(params['dec_dens'], z)
 
-    def predict_ilr(coord, chi_local):
-        return dec_ilr.apply(params['dec_ilr'], z, coord, chi_local)
+    def predict_ilr(coord, chi_local, rho_local):
+        return dec_ilr.apply(params['dec_ilr'], z, coord, chi_local, rho_local)
 
-    ilr_sample = vmap(predict_ilr)(all_coords_norm_jax, chi_sample)
+    ilr_sample = vmap(predict_ilr)(all_coords_norm_jax, chi_sample, rho_sample)
     ilr_samples.append(np.array(ilr_sample))
 
 ilr_samples = np.stack(ilr_samples)
 ilr_mean = ilr_samples.mean(axis=0)
 ilr_std = ilr_samples.std(axis=0)
 
-print(f"ILR prédit: {ilr_mean.min():.2f} – {ilr_mean.max():.2f}")
-print(f"Incertitude: {ilr_std.min():.3f} – {ilr_std.max():.3f}")
+print(f"ILR predicted: {ilr_mean.min():.2f} – {ilr_mean.max():.2f}")
+print(f"Uncertainty:   {ilr_std.min():.3f} – {ilr_std.max():.3f}")
 
 # %%
-# Convertir en compositions
 comp_pred = ilr_inverse(ilr_mean)
 Cu_pred = comp_pred[:, 0]
 
-print(f"Cu prédit: {Cu_pred.min()*100:.2f}% – {Cu_pred.max()*100:.2f}%")
-print(f"Cu vrai:   {Cu.min()*100:.2f}% – {Cu.max()*100:.2f}%")
+print(f"Cu predicted: {Cu_pred.min()*100:.2f}% – {Cu_pred.max()*100:.2f}%")
+print(f"Cu true:      {Cu.min()*100:.2f}% – {Cu.max()*100:.2f}%")
 
 # %% [markdown]
-# ## Métriques de validation
+# ## Validation Metrics
 
 # %%
-# Predict ILR at borehole locations using the mean latent
 def predict_ilr_at_coords(mu_latent, coords_norm, cell_idx):
     chi_val = dec_susc.apply(params['dec_susc'], mu_latent)
-    chi_at_coords = chi_val[cell_idx]
-    def predict(coord, chi_local):
-        return dec_ilr.apply(params['dec_ilr'], mu_latent, coord, chi_local)
-    return vmap(predict)(coords_norm, chi_at_coords)
+    rho_val = dec_dens.apply(params['dec_dens'], mu_latent)
+    chi_at = chi_val[cell_idx]
+    rho_at = rho_val[cell_idx]
+    def predict(coord, chi_l, rho_l):
+        return dec_ilr.apply(params['dec_ilr'], mu_latent, coord, chi_l, rho_l)
+    return vmap(predict)(coords_norm, chi_at, rho_at)
 
 # Training metrics
 train_ilr_pred = predict_ilr_at_coords(mu, train_coords_norm, train_cell_idx)
@@ -599,17 +856,24 @@ ss_res_chi = float(np.sum((chi_pred_np - susceptibility_true)**2))
 ss_tot_chi = float(np.sum((susceptibility_true - susceptibility_true.mean())**2))
 chi_r2 = 1 - ss_res_chi / ss_tot_chi
 
-print(f"--- Métriques de validation ---")
+# Density metrics
+rho_rmse = float(np.sqrt(np.mean((rho_pred_np - density_true)**2)))
+ss_res_rho = float(np.sum((rho_pred_np - density_true)**2))
+ss_tot_rho = float(np.sum((density_true - density_true.mean())**2))
+rho_r2 = 1 - ss_res_rho / ss_tot_rho
+
+print(f"--- Validation Metrics ---")
 print(f"ILR Train  RMSE: {train_rmse:.4f} | R²: {train_r2:.4f}")
 print(f"ILR Val    RMSE: {val_rmse:.4f} | R²: {val_r2:.4f}")
 print(f"χ global   RMSE: {chi_rmse:.6f} | R²: {chi_r2:.4f}")
+print(f"Δρ global  RMSE: {rho_rmse:.4f} | R²: {rho_r2:.4f}")
 
 # %% [markdown]
 # ---
-# # Partie 7: Visualisations
+# # Part 8: Visualizations
 
 # %%
-# Coupe horizontale à mi-profondeur
+# Horizontal slice at mid-depth
 iz = nz // 2
 idx_slice = slice(iz * nx * ny, (iz + 1) * nx * ny)
 
@@ -618,74 +882,103 @@ df_results = pd.DataFrame({
     'y': cc[idx_slice, 1],
     'chi_pred': chi_pred_np[idx_slice],
     'chi_true': susceptibility_true[idx_slice],
+    'rho_pred': rho_pred_np[idx_slice],
+    'rho_true': density_true[idx_slice],
     'Cu_pred': Cu_pred[idx_slice] * 100,
     'Cu_true': Cu[idx_slice] * 100,
     'uncertainty': ilr_std[idx_slice, 0]
 })
 
-# Distinguish train vs validation boreholes on plots
 df_holes_train = df_train.drop_duplicates('hole')[['x', 'y']]
 df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 
 # %%
 (
     lp.ggplot(df_results)
-    + lp.geom_tile(mapping= lp.aes('x', 'y', fill='chi_pred'))
+    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='chi_pred'))
     + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
     + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
     + lp.scale_fill_gradient(low='white', high='darkblue', name='χ (SI)')
-    + lp.labs(title=f'Susceptibilité prédite (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
+    + lp.labs(title=f'Predicted susceptibility (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
 
 # %%
 (
-    lp.ggplot(df_results, lp.aes('x', 'y'))
-    + lp.geom_tile(mapping=lp.aes(fill='chi_true'))
+    lp.ggplot(df_results)
+    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='chi_true'))
     + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
     + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
     + lp.scale_fill_gradient(low='white', high='darkblue', name='χ (SI)')
-    + lp.labs(title=f'Susceptibilité vraie (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
+    + lp.labs(title=f'True susceptibility (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
 
 # %%
 (
-    lp.ggplot(df_results, lp.aes('x', 'y'))
-    + lp.geom_tile(mapping=lp.aes(fill='Cu_pred'))
+    lp.ggplot(df_results)
+    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='rho_pred'))
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
+    + lp.scale_fill_gradient(low='white', high='#2d1b69', name='Δρ (g/cc)')
+    + lp.labs(title=f'Predicted density contrast (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
+)
+
+# %%
+(
+    lp.ggplot(df_results)
+    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='rho_true'))
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
+    + lp.scale_fill_gradient(low='white', high='#2d1b69', name='Δρ (g/cc)')
+    + lp.labs(title=f'True density contrast (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
+)
+
+# %%
+(
+    lp.ggplot(df_results)
+    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='Cu_pred'))
     + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
     + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
     + lp.scale_fill_gradient(low='white', high='darkred', name='Cu %')
-    + lp.labs(title=f'Cu prédit (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
+    + lp.labs(title=f'Predicted Cu (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
 
 # %%
 (
-    lp.ggplot(df_results, lp.aes('x', 'y', fill='Cu_true'))
-    + lp.geom_tile()
+    lp.ggplot(df_results)
+    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='Cu_true'))
     + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
     + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
     + lp.scale_fill_gradient(low='white', high='darkred', name='Cu %')
-    + lp.labs(title=f'Cu vrai (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
+    + lp.labs(title=f'True Cu (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
 
 # %%
 (
-    lp.ggplot(df_results, lp.aes('x', 'y'))
-    + lp.geom_tile(mapping=lp.aes(fill='uncertainty'))
+    lp.ggplot(df_results)
+    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='uncertainty'))
     + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
     + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
     + lp.scale_fill_gradient(low='white', high='purple', name='σ')
-    + lp.labs(title=f'Incertitude sur ILR[0] (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
+    + lp.labs(title=f'Uncertainty on ILR[0] (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
 
 # %% [markdown]
-# ## Comparaison quantitative
+# ## Quantitative Comparisons
 
 # %%
 (
     lp.ggplot(df_results, lp.aes('chi_true', 'chi_pred'))
     + lp.geom_point(alpha=0.5)
     + lp.geom_abline(slope=1, intercept=0, color='red', linetype='dashed')
-    + lp.labs(title='Susceptibilité: prédit vs vrai', x='χ vrai', y='χ prédit')
+    + lp.labs(title='Susceptibility: predicted vs true', x='χ true', y='χ predicted')
+)
+
+# %%
+(
+    lp.ggplot(df_results, lp.aes('rho_true', 'rho_pred'))
+    + lp.geom_point(alpha=0.5)
+    + lp.geom_abline(slope=1, intercept=0, color='red', linetype='dashed')
+    + lp.labs(title='Density contrast: predicted vs true', x='Δρ true (g/cc)', y='Δρ predicted (g/cc)')
 )
 
 # %%
@@ -693,32 +986,65 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
     lp.ggplot(df_results, lp.aes('Cu_true', 'Cu_pred'))
     + lp.geom_point(alpha=0.5)
     + lp.geom_abline(slope=1, intercept=0, color='red', linetype='dashed')
-    + lp.labs(title='Cu: prédit vs vrai', x='Cu vrai (%)', y='Cu prédit (%)')
+    + lp.labs(title='Cu: predicted vs true', x='Cu true (%)', y='Cu predicted (%)')
 )
 
 # %% [markdown]
 # ---
-# # Résumé
+# # Summary
 #
-# ## Ce qu'on a fait
+# ## Multi-Sensor Data Fusion for Mineral Exploration
 #
-# 1. **SimPEG** pour générer des données magnétiques réalistes
-# 2. **ILR** pour transformer les compositions (fermeture respectée)
-# 3. **Encodeur-décodeur avec PINN**:
-#    - Encoder CNN: magnétique 2D → latent (préserve la structure spatiale)
-#    - Decoder susceptibilité: latent → χ 3D (softplus, bien dimensionné)
-#    - Decoder ILR: latent + χ_local/CHI_NORM + (x,y,z) → compositions
-#    - Forward exact: χ → magnétique prédit via matrice G de SimPEG
-#    - Loss physique: ||mag_prédit - mag_observé||² / var(observé)
-#    - Régularisation: lissage + smallness, normalisés par CHI_NORM
-# 4. **Incertitude** par sampling du latent (100 échantillons)
-# 5. **Validation** sur forages retenus (DH4, DH7) avec RMSE et R²
+# This exercise demonstrates a KoBold Metals-style approach to exploration
+# data integration, where multiple heterogeneous data sources are fused
+# through a shared latent space for joint geophysical-geochemical inversion.
 #
-# ## Améliorations clés
+# ### Data Integration
 #
-# - χ_local normalisé (÷ CHI_NORM) comme entrée au décodeur ILR
-# - lambda_recon=5: les forages guident la susceptibilité via le lien χ→ILR
-# - Matrice G de SimPEG pour forward exact (au lieu d'approximation dipôle)
-# - Régularisation normalisée par CHI_NORM: smoothness + smallness à O(1)
-# - CNN encoder, softplus, KL annealing, LR schedule cosine (8000 epochs)
-# - Bruit réaliste sur forages, validation train/test
+# | Source           | Information               | Role in Architecture       |
+# |------------------|---------------------------|----------------------------|
+# | Airborne mag     | Magnetic susceptibility   | CNN encoder + forward loss |
+# | Ground gravity   | Density contrast          | CNN encoder + forward loss |
+# | Hyperspectral    | Surface alteration        | CNN encoder (data-driven)  |
+# | Soil geochemistry| Pathfinder elements       | CNN encoder (data-driven)  |
+# | Drill holes      | Direct Cu, Ni, Co assays  | Reconstruction loss        |
+#
+# ### Key Design Choices
+#
+# 1. **Multi-branch encoder**: Each sensor has its own CNN branch,
+#    allowing the network to learn modality-specific features before
+#    fusion. This mirrors KoBold's approach of specialized processors
+#    feeding into a unified data platform (TerraShed).
+#
+# 2. **Joint inversion via shared latent space**: Susceptibility and
+#    density are decoded from the same latent vector, enforcing
+#    cross-property consistency. The ILR decoder receives both χ and Δρ
+#    as inputs, creating a direct physical bridge between geophysical
+#    properties and mineral compositions.
+#
+# 3. **Multi-physics PINN losses**: Both magnetic and gravity forward
+#    models constrain the inversion — the predicted physical properties
+#    must reproduce the observed survey data. This is the "physics-informed"
+#    component that distinguishes this from a purely data-driven approach.
+#
+# 4. **Uncertainty quantification**: Posterior sampling from the VAE
+#    latent space propagates uncertainty through all decoders, providing
+#    spatially-varying confidence estimates for exploration targeting.
+#
+# ### Comparison to KoBold Metals' Approach
+#
+# | KoBold                          | This Exercise                     |
+# |---------------------------------|-----------------------------------|
+# | TerraShed (data platform)       | Multi-branch encoder              |
+# | Machine Prospector (ML engine)  | VAE + multi-physics decoder       |
+# | Full-physics joint inversion    | G_mag @ χ + G_grav @ Δρ losses    |
+# | Helicopter EM / SQUID           | (could add EM forward model)      |
+# | Hyperpod (spectral + LiDAR)     | Hyperspectral CNN branch          |
+# | Geochemical analysis            | Soil geochem + drill hole assays  |
+# | Uncertainty quantification      | Posterior sampling (100 draws)    |
+#
+# ### References
+#
+# - KoBold Metals. AI-powered mineral exploration.
+#   IEEE Spectrum (2024): https://spectrum.ieee.org/ai-mining
+# - Eagar, K. (SimPEG). Open-source geophysical modeling.
