@@ -28,36 +28,33 @@
 #                └──────────────┘  │    │  MLP    │       │
 #                ┌──────────────┐  │    └─────────┘       │
 # Hyperspectral ▶│ CNN Branch 3 │──┤                      │
-#  (10 bands)    └──────────────┘  │                      │
-#                ┌──────────────┐  │          ┌───────────┴───────────┐
-# Geochemistry ─▶│ CNN Branch 4 │──┘          │                       │
-#  (gridded)     └──────────────┘             ▼                       ▼
-#                                    ┌────────────────┐     ┌────────────────┐
-#                                    │  DECODER_SUSC  │     │ DECODER_DENSITY│
-#                                    │ latent → χ(3D) │     │ latent → Δρ(3D)│
-#                                    └───────┬────────┘     └───────┬────────┘
-#                                            │  ┌───────────────────┘
-#                                            ▼  ▼
-#                                    ┌────────────────┐
-#                                    │  DECODER_ILR   │
-#                                    │ z + χ + Δρ +   │
-#                                    │ (x,y,z) → ILR  │
-#                                    └───────┬────────┘
-#                                            │
-#                  ┌─────────────────────────┼──────────────────────────┐
-#                  │                         │                          │
-#                  ▼                         ▼                          ▼
-#          ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-#          │ FORWARD MAG  │         │ FORWARD GRAV │         │Loss reconstr.│
-#          │  G_mag @ χ   │         │  G_grav @ Δρ │         │(vs boreholes)│
-#          └──────┬───────┘         └──────┬───────┘         └──────────────┘
-#                 ▼                        ▼
-#          Loss magnetics           Loss gravity
+#  (10 bands)    └──────────────┘  │           ┌──────────┼──────────────────────────┐
+#                ┌──────────────┐  │           │          │          │               │
+# Geochemistry ─▶│ CNN Branch 4 │──┘           ▼          ▼          ▼               ▼
+#  (gridded)     └──────────────┘     ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+#                                     │DEC_SUSC  │ │DEC_DENS  │ │DEC_HYPER │ │DEC_GEOCH │
+#                                     │z → χ(3D) │ │z → Δρ(3D)│ │z → refl. │ │z → soil  │
+#                                     └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘
+#                                          │  ┌─────────┘            │             │
+#                   ┌──────────────────────┐▼  ▼                     ▼             ▼
+#                   │      DECODER_ILR     │         Loss hyper.   Loss geochem.
+#                   │ z + χ + Δρ + (x,y,z) │
+#                   │       → ILR          │
+#                   └──────────┬───────────┘
+#              ┌───────────────┼───────────────┐
+#              ▼               ▼               ▼
+#       ┌────────────┐ ┌────────────┐  ┌──────────────┐
+#       │ FORWARD MAG│ │FORWARD GRAV│  │Loss reconstr.│
+#       │  G_mag @ χ │ │ G_grav @ Δρ│  │(vs boreholes)│
+#       └─────┬──────┘ └─────┬──────┘  └──────────────┘
+#             ▼              ▼
+#       Loss magnetics  Loss gravity
 # ```
 #
-# **Joint inversion**: the shared latent space forces consistency between
-# magnetic susceptibility, density contrast, and mineral compositions.
-# Physics-informed losses ensure predictions honor observed geophysical data.
+# **Joint inversion**: the shared latent space forces consistency across
+# all 6 data-driven losses. Every sensor constrains z — no free inputs.
+# Physics-informed losses (magnetics, gravity) ensure geophysical consistency.
+# Surface decoders ensure z captures alteration and geochemical patterns.
 
 # %% [markdown]
 # ## Setup
@@ -542,9 +539,51 @@ class DecoderILR(nn.Module):
         x = nn.relu(x)
         return nn.Dense(3)(x)
 
+
+class DecoderHyperspectral(nn.Module):
+    """
+    Latent → predicted surface reflectance image (ny × nx × n_bands).
+    The latent must encode enough information to reconstruct the
+    surface alteration pattern observed by the hyperspectral sensor.
+    """
+    ny: int
+    nx: int
+    n_bands: int
+
+    @nn.compact
+    def __call__(self, latent):
+        x = nn.Dense(256)(latent)
+        x = nn.relu(x)
+        x = nn.Dense(512)(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.ny * self.nx * self.n_bands)(x)
+        return nn.sigmoid(x).reshape(self.ny, self.nx, self.n_bands)
+
+
+class DecoderGeochem(nn.Module):
+    """
+    Latent → predicted surface geochemistry grid (ny × nx × n_elements).
+    Reconstructs the interpolated soil geochemistry (normalized to [0,1]).
+    """
+    ny: int
+    nx: int
+    n_elements: int
+
+    @nn.compact
+    def __call__(self, latent):
+        x = nn.Dense(256)(latent)
+        x = nn.relu(x)
+        x = nn.Dense(self.ny * self.nx * self.n_elements)(x)
+        return nn.sigmoid(x).reshape(self.ny, self.nx, self.n_elements)
+
 # %% [markdown]
 # ---
-# # Part 5: Multi-Physics Loss Function
+# # Part 5: Multi-Physics + Multi-Sensor Loss Function
+#
+# Every data source contributes a loss term — no free inputs:
+# - **Magnetics / Gravity**: physics-based forward model losses (G @ property)
+# - **Hyperspectral / Geochemistry**: learned decoder reconstruction losses
+# - **Drill holes**: ILR composition reconstruction loss
 
 # %%
 def smoothness_loss(field, nx, ny, nz, norm):
@@ -562,19 +601,23 @@ def smallness_loss(field, ref, norm):
 
 
 def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
+            dec_hyper, dec_geochem,
             mag_grid, grav_grid, hyper_img, geochem_grid,
             mag_observed, grav_observed,
+            hyper_observed, geochem_observed,
             train_coords_norm, train_ilr, train_cell_idx,
             rng_key,
             lambda_recon=5.0, lambda_mag=1.0, lambda_grav=1.0,
+            lambda_hyper=1.0, lambda_geochem=1.0,
             lambda_kl=0.01, lambda_smooth=0.1, lambda_small=0.05):
     """
-    Multi-physics loss:
-    - Magnetic forward: ||G_mag @ χ - mag_obs||² / var(mag_obs)
-    - Gravity forward:  ||G_grav @ Δρ - grav_obs||² / var(grav_obs)
-    - ILR reconstruction at drill holes (with chi + rho inputs)
-    - KL divergence for latent regularization
-    - Smoothness + smallness for both χ and Δρ
+    Multi-physics + multi-sensor loss. Every data source has a loss:
+    - Magnetic forward:    ||G_mag @ χ - mag_obs||² / var      (physics)
+    - Gravity forward:     ||G_grav @ Δρ - grav_obs||² / var   (physics)
+    - Hyperspectral:       ||dec_hyper(z) - hyper_obs||²        (surface)
+    - Geochemistry:        ||dec_geochem(z) - geochem_obs||²    (surface)
+    - ILR reconstruction:  ||dec_ilr(z,χ,ρ,xyz) - ilr_obs||²   (borehole)
+    - KL divergence + smoothness + smallness regularization
     """
 
     # --- Encode ---
@@ -588,12 +631,19 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
     chi_pred = dec_susc.apply(params['dec_susc'], z)
     rho_pred = dec_dens.apply(params['dec_dens'], z)
 
-    # --- Forward models (PINN) ---
+    # --- Forward models (PINN) — geophysical consistency ---
     mag_pred = forward_magnetic_jax(chi_pred)
     grav_pred = forward_gravity_jax(rho_pred)
 
     loss_mag = jnp.mean((mag_pred - mag_observed)**2) / jnp.var(mag_observed)
     loss_grav = jnp.mean((grav_pred - grav_observed)**2) / jnp.var(grav_observed)
+
+    # --- Surface consistency — hyperspectral + geochemistry ---
+    hyper_pred = dec_hyper.apply(params['dec_hyper'], z)
+    geochem_pred = dec_geochem.apply(params['dec_geochem'], z)
+
+    loss_hyper = jnp.mean((hyper_pred - hyper_observed)**2)
+    loss_geochem = jnp.mean((geochem_pred - geochem_observed)**2)
 
     # --- Regularization (both fields) ---
     loss_smooth = (smoothness_loss(chi_pred, nx, ny, nz, CHI_NORM) +
@@ -619,12 +669,15 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
                   + lambda_kl * loss_kl
                   + lambda_mag * loss_mag
                   + lambda_grav * loss_grav
+                  + lambda_hyper * loss_hyper
+                  + lambda_geochem * loss_geochem
                   + lambda_smooth * loss_smooth
                   + lambda_small * loss_small)
 
     return loss_total, {
         'total': loss_total, 'recon': loss_recon,
         'kl': loss_kl, 'mag': loss_mag, 'grav': loss_grav,
+        'hyper': loss_hyper, 'geochem': loss_geochem,
         'smooth': loss_smooth, 'small': loss_small,
         'chi_max': jnp.max(chi_pred), 'rho_max': jnp.max(rho_pred)
     }
@@ -636,13 +689,15 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
 # %%
 # Initialize all modules
 rng = random.PRNGKey(42)
-rng, *init_rngs = random.split(rng, 5)
+rng, *init_rngs = random.split(rng, 7)
 
 latent_dim = 32
 encoder = MultiModalEncoder(latent_dim=latent_dim)
 dec_susc = DecoderSusceptibility(n_cells=n_cells)
 dec_dens = DecoderDensity(n_cells=n_cells)
 dec_ilr = DecoderILR()
+dec_hyper = DecoderHyperspectral(ny=ny, nx=nx, n_bands=n_bands)
+dec_geochem = DecoderGeochem(ny=ny, nx=nx, n_elements=5)
 
 # Dummy inputs for initialization
 dummy_mag = jnp.zeros((n_stations_mag, n_stations_mag))
@@ -658,7 +713,9 @@ params = {
     'encoder': encoder.init(init_rngs[0], dummy_mag, dummy_grav, dummy_hyper, dummy_geochem),
     'dec_susc': dec_susc.init(init_rngs[1], dummy_latent),
     'dec_dens': dec_dens.init(init_rngs[2], dummy_latent),
-    'dec_ilr': dec_ilr.init(init_rngs[3], dummy_latent, dummy_coord, dummy_chi, dummy_rho)
+    'dec_ilr': dec_ilr.init(init_rngs[3], dummy_latent, dummy_coord, dummy_chi, dummy_rho),
+    'dec_hyper': dec_hyper.init(init_rngs[4], dummy_latent),
+    'dec_geochem': dec_geochem.init(init_rngs[5], dummy_latent)
 }
 
 # %%
@@ -674,6 +731,10 @@ geochem_grid_jax = jnp.array(geochem_grid_2d)
 
 mag_obs_jax = jnp.array(mag_observed)
 grav_obs_jax = jnp.array(grav_observed)
+
+# Surface observations for consistency losses
+hyper_obs_jax = jnp.array(hyper_image)       # (16, 16, 10) already in [0,1]
+geochem_obs_jax = jnp.array(geochem_grid_2d) # (16, 16, 5) already normalized to [0,1]
 
 # Drill hole coordinates (normalized)
 coord_mean = jnp.array([nx*dx/2, ny*dy/2, -nz*dz/2])
@@ -708,13 +769,17 @@ kl_target = 0.01
 def train_step(params, opt_state, rng_key, lambda_kl):
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
         params, encoder, dec_susc, dec_dens, dec_ilr,
+        dec_hyper, dec_geochem,
         mag_grid_norm, grav_grid_norm, hyper_img_jax, geochem_grid_jax,
         mag_obs_jax, grav_obs_jax,
+        hyper_obs_jax, geochem_obs_jax,
         train_coords_norm, train_ilr, train_cell_idx,
         rng_key,
         lambda_recon=5.0,
         lambda_mag=1.0,
         lambda_grav=1.0,
+        lambda_hyper=1.0,
+        lambda_geochem=1.0,
         lambda_kl=lambda_kl,
         lambda_smooth=0.1,
         lambda_small=0.05
@@ -737,7 +802,8 @@ for epoch in range(n_epochs):
     if epoch % 1000 == 0:
         print(f"Epoch {epoch:4d} | loss={aux['total']:.4f} | recon={aux['recon']:.4f} | "
               f"mag={aux['mag']:.4f} | grav={aux['grav']:.4f} | "
-              f"smooth={aux['smooth']:.4f} | χ_max={aux['chi_max']:.4f} | ρ_max={aux['rho_max']:.4f}")
+              f"hyper={aux['hyper']:.4f} | geochem={aux['geochem']:.4f} | "
+              f"χ_max={aux['chi_max']:.4f} | ρ_max={aux['rho_max']:.4f}")
 
 # %%
 # Training curves
@@ -748,6 +814,8 @@ df_hist = pd.DataFrame(history)
     + lp.geom_line(lp.aes(y='recon'), color="#962561")
     + lp.geom_line(lp.aes(y='mag'), color="#abc000")
     + lp.geom_line(lp.aes(y='grav'), color="#006080")
+    + lp.geom_line(lp.aes(y='hyper'), color="#e94560")
+    + lp.geom_line(lp.aes(y='geochem'), color="#f5a623")
     + lp.geom_line(lp.aes(y='smooth'), color="#00abc0")
     + lp.geom_line(lp.aes(y='small'), color="#c06000")
     + lp.scale_y_log10()
@@ -999,15 +1067,15 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 # data integration, where multiple heterogeneous data sources are fused
 # through a shared latent space for joint geophysical-geochemical inversion.
 #
-# ### Data Integration
+# ### Data Integration — Every Source Has a Loss
 #
-# | Source           | Information               | Role in Architecture       |
-# |------------------|---------------------------|----------------------------|
-# | Airborne mag     | Magnetic susceptibility   | CNN encoder + forward loss |
-# | Ground gravity   | Density contrast          | CNN encoder + forward loss |
-# | Hyperspectral    | Surface alteration        | CNN encoder (data-driven)  |
-# | Soil geochemistry| Pathfinder elements       | CNN encoder (data-driven)  |
-# | Drill holes      | Direct Cu, Ni, Co assays  | Reconstruction loss        |
+# | Source           | Information               | Encoder input  | Loss type                |
+# |------------------|---------------------------|----------------|--------------------------|
+# | Airborne mag     | Magnetic susceptibility   | CNN branch     | Physics: G_mag @ χ       |
+# | Ground gravity   | Density contrast          | CNN branch     | Physics: G_grav @ Δρ     |
+# | Hyperspectral    | Surface alteration        | CNN branch     | Decoder: z → reflectance |
+# | Soil geochemistry| Pathfinder elements       | CNN branch     | Decoder: z → soil grid   |
+# | Drill holes      | Direct Cu, Ni, Co assays  | (supervision)  | Decoder: z+χ+Δρ → ILR   |
 #
 # ### Key Design Choices
 #
@@ -1022,10 +1090,11 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 #    as inputs, creating a direct physical bridge between geophysical
 #    properties and mineral compositions.
 #
-# 3. **Multi-physics PINN losses**: Both magnetic and gravity forward
-#    models constrain the inversion — the predicted physical properties
-#    must reproduce the observed survey data. This is the "physics-informed"
-#    component that distinguishes this from a purely data-driven approach.
+# 3. **No free inputs — every sensor constrains z**: Magnetics and gravity
+#    use physics-based forward models (G matrices from SimPEG). Hyperspectral
+#    and geochemistry use learned decoders that must reconstruct the observed
+#    surface data from z. This ensures the latent space truly encodes
+#    information from all sensors, not just the ones with physics losses.
 #
 # 4. **Uncertainty quantification**: Posterior sampling from the VAE
 #    latent space propagates uncertainty through all decoders, providing
