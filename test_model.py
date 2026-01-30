@@ -1,301 +1,265 @@
 """
-Test v8: Boost reconstruction loss weight.
-
-Best results so far: v3/v6 with Cu corr=0.54, Cu R²=-0.37/-0.84.
-The bottleneck is chi spatial accuracy (R²=0.26 at best).
-
-Idea: Increase reconstruction weight (lambda_recon=5) so the model prioritizes
-matching borehole compositions. This creates stronger gradients for chi to
-arrange itself correctly at borehole locations, improving spatial accuracy.
-
-Also try: original v3 regularization (stronger = better for smooth Gaussian blobs).
+Test the multi-sensor model end-to-end.
+Coordinate-conditioned decoders (NeRF-style) for spatial resolution.
 """
 import numpy as np
 import pandas as pd
 import jax
 import jax.numpy as jnp
-from jax import random, jit, vmap
+from jax import random, vmap
 import flax.linen as nn
 import optax
+from scipy.interpolate import griddata
 from simpeg import maps
-from simpeg.potential_fields import magnetics
+from simpeg.potential_fields import magnetics, gravity
 from discretize import TensorMesh
+import time
 
-print("=== Setup ===")
+# ============================================================
+# 1. DATA (same as exercice.py)
+# ============================================================
 nx, ny, nz = 16, 16, 8
 dx, dy, dz = 250, 250, 125
-mesh = TensorMesh(
-    [np.ones(nx)*dx, np.ones(ny)*dy, np.ones(nz)*dz],
-    origin=[0, 0, -nz*dz]
-)
-n_cells = mesh.nC
-cc = mesh.cell_centers
+mesh = TensorMesh([np.ones(nx)*dx, np.ones(ny)*dy, np.ones(nz)*dz], origin=[0,0,-nz*dz])
+n_cells = mesh.nC; cc = mesh.cell_centers
 
-d1 = np.sqrt(((cc[:,0]-1500)/400)**2 + ((cc[:,1]-1500)/350)**2 + ((cc[:,2]+500)/150)**2)
-body1 = np.exp(-d1**2 * 2)
-d2 = np.sqrt(((cc[:,0]-2800)/350)**2 + ((cc[:,1]-2500)/300)**2 + ((cc[:,2]+700)/120)**2)
-body2 = np.exp(-d2**2 * 2)
-
-susceptibility_true = 0.001 + body1 * 0.05 + body2 * 0.02
-Cu = 0.005 + body1 * 0.02 + body2 * 0.01
-Ni = 0.003 + body1 * 0.01 + body2 * 0.025
-Co = 0.001 + body1 * 0.005 + body2 * 0.012
-gangue = 1 - Cu - Ni - Co
-compositions = np.stack([Cu, Ni, Co, gangue], axis=1)
+d1 = np.sqrt(((cc[:,0]-1500)/400)**2+((cc[:,1]-1500)/350)**2+((cc[:,2]+500)/150)**2)
+body1 = np.exp(-d1**2*2)
+d2 = np.sqrt(((cc[:,0]-2800)/350)**2+((cc[:,1]-2500)/300)**2+((cc[:,2]+700)/120)**2)
+body2 = np.exp(-d2**2*2)
+susceptibility_true = 0.001+body1*0.05+body2*0.02
+density_true = body1*0.5+body2*0.3
+Cu = 0.005+body1*0.02+body2*0.01
+Ni = 0.003+body1*0.01+body2*0.025
+Co = 0.001+body1*0.005+body2*0.012
+gangue = 1-Cu-Ni-Co
+compositions = np.stack([Cu,Ni,Co,gangue], axis=1)
 
 V_helmert = np.array([
-    [np.sqrt(3/4), -1/np.sqrt(12), -1/np.sqrt(12), -1/np.sqrt(12)],
-    [0, np.sqrt(2/3), -1/np.sqrt(6), -1/np.sqrt(6)],
-    [0, 0, np.sqrt(1/2), -np.sqrt(1/2)]
+    [np.sqrt(3/4),-1/np.sqrt(12),-1/np.sqrt(12),-1/np.sqrt(12)],
+    [0,np.sqrt(2/3),-1/np.sqrt(6),-1/np.sqrt(6)],
+    [0,0,np.sqrt(1/2),-np.sqrt(1/2)]
 ])
-def ilr_transform(comp):
-    return np.log(comp + 1e-10) @ V_helmert.T
+def ilr_transform(comp): return np.log(comp+1e-10)@V_helmert.T
 def ilr_inverse(ilr):
-    comp = np.exp(ilr @ V_helmert)
-    return comp / comp.sum(axis=1, keepdims=True)
+    c=np.exp(ilr@V_helmert); return c/c.sum(axis=1,keepdims=True)
 
-n_stations = 12
-sx = np.linspace(300, nx*dx-300, n_stations)
-sy = np.linspace(300, ny*dy-300, n_stations)
-stations = np.array([[x, y, 50] for x in sx for y in sy])
-
-receivers = magnetics.receivers.Point(stations, components='tmi')
-source = magnetics.sources.UniformBackgroundField(
-    receiver_list=[receivers], amplitude=55000, inclination=70, declination=0
-)
-sim = magnetics.Simulation3DIntegral(
-    mesh=mesh, survey=magnetics.Survey(source), chiMap=maps.IdentityMap(mesh),
-    active_cells=np.ones(n_cells, dtype=bool), store_sensitivities='ram'
-)
 rng_np = np.random.default_rng(42)
-mag_observed = sim.dpred(susceptibility_true) + rng_np.normal(0, 1.5, len(stations))
-G_jax = jnp.array(sim.G)
+n_st = 20
+sx = np.linspace(200,nx*dx-200,n_st); sy = np.linspace(200,ny*dy-200,n_st)
+stations_mag = np.array([[x,y,80.] for x in sx for y in sy])
+rec_m = magnetics.receivers.Point(stations_mag,components='tmi')
+src_m = magnetics.sources.UniformBackgroundField(receiver_list=[rec_m],amplitude=55000,inclination=70,declination=0)
+sim_m = magnetics.Simulation3DIntegral(mesh=mesh,survey=magnetics.Survey(src_m),chiMap=maps.IdentityMap(mesh),active_cells=np.ones(n_cells,dtype=bool),store_sensitivities='ram')
+mag_obs_np = sim_m.dpred(susceptibility_true)+rng_np.normal(0,1.5,n_st**2)
+G_mag = jnp.array(sim_m.G)
 
-@jit
-def forward_magnetic_jax(susceptibility):
-    return G_jax @ susceptibility
+stations_grav = np.array([[x,y,1.] for x in sx for y in sy])
+rec_g = gravity.receivers.Point(stations_grav,components='gz')
+src_g = gravity.sources.SourceField(receiver_list=[rec_g])
+sim_g = gravity.Simulation3DIntegral(mesh=mesh,survey=gravity.survey.Survey(source_field=src_g),rhoMap=maps.IdentityMap(mesh),active_cells=np.ones(n_cells,dtype=bool),store_sensitivities='ram')
+grav_obs_np = sim_g.dpred(density_true)+rng_np.normal(0,0.02,n_st**2)
+G_grav = jnp.array(sim_g.G)
 
-hole_xy = [
-    (1500, 1500), (2800, 2500), (500, 500), (2000, 2000), (3500, 1000),
-    (1200, 1800), (2500, 2200), (1800, 2800), (3000, 1500), (800, 2500)
-]
-validation_holes = {'DH4', 'DH7'}
-forages = []
-for i, (hx, hy) in enumerate(hole_xy):
-    ix, iy = np.argmin(np.abs(mesh.cell_centers_x - hx)), np.argmin(np.abs(mesh.cell_centers_y - hy))
+surface_xx,surface_yy = np.meshgrid(mesh.cell_centers_x,mesh.cell_centers_y)
+d1s = np.sqrt(((surface_xx-1500)/600)**2+((surface_yy-1500)/550)**2)
+b1s = np.exp(-d1s**2*1.5)*0.4
+d2s = np.sqrt(((surface_xx-2800)/550)**2+((surface_yy-2500)/500)**2)
+b2s = np.exp(-d2s**2*1.5)*0.25
+n_bands=10
+em_bg=np.array([.30,.32,.35,.33,.30,.28,.25,.27,.30,.28])
+em_fe=np.array([.15,.22,.38,.55,.68,.62,.48,.42,.38,.33])
+em_cl=np.array([.40,.45,.50,.52,.58,.50,.40,.28,.18,.22])
+ff=b1s+.5*b2s; fc=.5*b1s+b2s; fb=np.clip(1-ff-fc,.1,1.)
+tt=fb+ff+fc; fb/=tt; ff/=tt; fc/=tt
+hyper_img = np.clip(fb[:,:,None]*em_bg+ff[:,:,None]*em_fe+fc[:,:,None]*em_cl+rng_np.normal(0,.02,(ny,nx,n_bands)),0,1)
+
+n_soil=50
+sx_s=rng_np.uniform(200,nx*dx-200,n_soil); sy_s=rng_np.uniform(200,ny*dy-200,n_soil)
+d1_s=np.sqrt(((sx_s-1500)/600)**2+((sy_s-1500)/550)**2); b1_s=np.exp(-d1_s**2*1.5)*0.4
+d2_s=np.sqrt(((sx_s-2800)/550)**2+((sy_s-2500)/500)**2); b2_s=np.exp(-d2_s**2*1.5)*0.25
+Cu_s=np.clip(30+b1_s*500+b2_s*300+rng_np.normal(0,10,n_soil),5,None)
+Ni_s=np.clip(20+b1_s*200+b2_s*600+rng_np.normal(0,8,n_soil),5,None)
+Co_s=np.clip(8+b1_s*80+b2_s*200+rng_np.normal(0,4,n_soil),2,None)
+Fe_s=3.+b1_s*5+b2_s*3+rng_np.normal(0,.3,n_soil)
+S_s=.1+b1_s*2+b2_s*1.5+rng_np.normal(0,.05,n_soil)
+gxy=np.column_stack([surface_xx.ravel(),surface_yy.ravel()])
+sxy=np.column_stack([sx_s,sy_s])
+gc=np.zeros((nx*ny,5))
+for i,v in enumerate([Cu_s,Ni_s,Co_s,Fe_s,S_s]):
+    gl=griddata(sxy,v,gxy,method='linear'); gn=griddata(sxy,v,gxy,method='nearest')
+    gc[:,i]=np.where(np.isnan(gl),gn,gl)
+gcn=(gc-gc.min(0))/(gc.max(0)-gc.min(0)+1e-8)
+geochem_2d=gcn.reshape(ny,nx,5)
+
+hole_xy=[(1500,1500),(2800,2500),(500,500),(2000,2000),(3500,1000),(1200,1800),(2500,2200),(1800,2800),(3000,1500),(800,2500)]
+forages=[]
+for i,(hx,hy) in enumerate(hole_xy):
+    ix=np.argmin(np.abs(mesh.cell_centers_x-hx)); iy=np.argmin(np.abs(mesh.cell_centers_y-hy))
     for iz in range(nz):
-        idx = ix + iy * nx + iz * nx * ny
-        cu_n = max(Cu[idx] * (1 + rng_np.normal(0, 0.05)), 1e-6)
-        ni_n = max(Ni[idx] * (1 + rng_np.normal(0, 0.05)), 1e-6)
-        co_n = max(Co[idx] * (1 + rng_np.normal(0, 0.05)), 1e-6)
-        ga_n = max(1 - cu_n - ni_n - co_n, 1e-6)
-        ilr_n = ilr_transform(np.array([[cu_n, ni_n, co_n, ga_n]]))[0]
-        hole_name = f'DH{i+1}'
-        forages.append({
-            'hole': hole_name, 'x': mesh.cell_centers_x[ix], 'y': mesh.cell_centers_y[iy],
-            'z': mesh.cell_centers_z[iz], 'ilr0': ilr_n[0], 'ilr1': ilr_n[1], 'ilr2': ilr_n[2],
-            'cell_idx': idx, 'is_validation': hole_name in validation_holes
-        })
-df = pd.DataFrame(forages)
-df_train = df[~df['is_validation']].reset_index(drop=True)
-df_val = df[df['is_validation']].reset_index(drop=True)
-print(f"Train: {len(df_train)} | Val: {len(df_val)}")
+        idx=ix+iy*nx+iz*nx*ny
+        cn=max(Cu[idx]*(1+rng_np.normal(0,.05)),1e-6)
+        nn_=max(Ni[idx]*(1+rng_np.normal(0,.05)),1e-6)
+        co=max(Co[idx]*(1+rng_np.normal(0,.05)),1e-6)
+        ga=max(1-cn-nn_-co,1e-6)
+        il=ilr_transform(np.array([[cn,nn_,co,ga]]))[0]
+        hn=f'DH{i+1}'
+        forages.append({'hole':hn,'x':mesh.cell_centers_x[ix],'y':mesh.cell_centers_y[iy],'z':mesh.cell_centers_z[iz],'ilr0':il[0],'ilr1':il[1],'ilr2':il[2],'cell_idx':idx,'is_validation':hn in {'DH4','DH7'}})
+df=pd.DataFrame(forages)
+df_tr=df[~df['is_validation']].reset_index(drop=True)
+df_va=df[df['is_validation']].reset_index(drop=True)
+print(f"Data ready: {n_st**2} mag/grav, {hyper_img.shape} hyper, {n_soil} soil, {len(df_tr)}/{len(df_va)} train/val")
 
-CHI_NORM = 0.01
-CHI_REF = 0.001
-
+# ============================================================
+# 2. MODEL — Coordinate-conditioned decoders (NeRF-style)
+# ============================================================
 class Encoder(nn.Module):
-    latent_dim: int = 16
+    latent_dim: int=32
     @nn.compact
-    def __call__(self, mag_grid):
-        x = mag_grid[jnp.newaxis, :, :, jnp.newaxis]
-        x = nn.Conv(16, kernel_size=(3, 3), padding='SAME')(x)
-        x = nn.relu(x)
-        x = nn.Conv(32, kernel_size=(3, 3), padding='SAME')(x)
-        x = nn.relu(x)
-        x = x.ravel()
-        x = nn.Dense(64)(x)
-        x = nn.relu(x)
-        mu = nn.Dense(self.latent_dim)(x)
-        log_var = nn.Dense(self.latent_dim)(x)
-        return mu, log_var
+    def __call__(self, mg, gg, hi, gc):
+        m=nn.relu(nn.Conv(16,(3,3),padding='SAME')(mg[jnp.newaxis,:,:,jnp.newaxis]))
+        m=nn.relu(nn.Conv(32,(3,3),padding='SAME')(m))
+        m=nn.relu(nn.Dense(64)(m.ravel()))
+        g=nn.relu(nn.Conv(16,(3,3),padding='SAME')(gg[jnp.newaxis,:,:,jnp.newaxis]))
+        g=nn.relu(nn.Conv(32,(3,3),padding='SAME')(g))
+        g=nn.relu(nn.Dense(64)(g.ravel()))
+        h=nn.relu(nn.Conv(16,(3,3),padding='SAME')(hi[jnp.newaxis,:,:,:]))
+        h=nn.relu(nn.Conv(32,(3,3),padding='SAME')(h))
+        h=nn.relu(nn.Dense(64)(h.ravel()))
+        c=nn.relu(nn.Conv(16,(3,3),padding='SAME')(gc[jnp.newaxis,:,:,:]))
+        c=nn.relu(nn.Dense(32)(c.ravel()))
+        f=jnp.concatenate([m,g,h,c])
+        f=nn.relu(nn.Dense(128)(f)); f=nn.relu(nn.Dense(64)(f))
+        return nn.Dense(self.latent_dim)(f), nn.Dense(self.latent_dim)(f)
 
-class DecoderSusceptibility(nn.Module):
-    n_cells: int
+class DecSusc(nn.Module):
+    """(z, coord_norm) → chi_local (scalar). Coordinate-conditioned.
+    softplus(0)*0.01 = 0.007 — between background (0.001) and anomaly (0.024)."""
     @nn.compact
-    def __call__(self, latent):
-        x = nn.Dense(128)(latent)
-        x = nn.relu(x)
-        x = nn.Dense(256)(x)
-        x = nn.relu(x)
-        x = nn.Dense(512)(x)
-        x = nn.relu(x)
-        raw = nn.Dense(self.n_cells)(x)
-        return nn.softplus(raw) * 0.01
+    def __call__(self, z, coord):
+        x=jnp.concatenate([z, coord])
+        x=nn.relu(nn.Dense(128)(x))
+        x=nn.relu(nn.Dense(64)(x))
+        x=nn.relu(nn.Dense(32)(x))
+        return nn.softplus(nn.Dense(1)(x).squeeze()) * 0.01
 
-class DecoderILR(nn.Module):
+class DecDens(nn.Module):
+    """(z, coord_norm) → rho_local (scalar). Coordinate-conditioned.
+    softplus(0)*0.1 = 0.069 — between background (0) and anomaly (0.5)."""
     @nn.compact
-    def __call__(self, latent, coord_norm, chi_local):
-        chi_normalized = chi_local / CHI_NORM
-        x = jnp.concatenate([latent, jnp.atleast_1d(chi_normalized), coord_norm])
-        x = nn.Dense(64)(x)
-        x = nn.relu(x)
-        x = nn.Dense(32)(x)
-        x = nn.relu(x)
+    def __call__(self, z, coord):
+        x=jnp.concatenate([z, coord])
+        x=nn.relu(nn.Dense(128)(x))
+        x=nn.relu(nn.Dense(64)(x))
+        x=nn.relu(nn.Dense(32)(x))
+        return nn.softplus(nn.Dense(1)(x).squeeze()) * 0.1
+
+class DecILR(nn.Module):
+    """(z, coord_norm, chi_local, rho_local) → ILR (3-dim)."""
+    @nn.compact
+    def __call__(self, z, coord, chi_l, rho_l):
+        x=jnp.concatenate([z, coord, jnp.atleast_1d(chi_l*100), jnp.atleast_1d(rho_l*10)])
+        x=nn.relu(nn.Dense(64)(x))
+        x=nn.relu(nn.Dense(32)(x))
         return nn.Dense(3)(x)
 
-def smoothness_loss(chi, nx, ny, nz):
-    chi_n = chi / CHI_NORM
-    chi_3d = chi_n.reshape(nz, ny, nx)
-    ddx = jnp.sum((chi_3d[:, :, 1:] - chi_3d[:, :, :-1])**2)
-    ddy = jnp.sum((chi_3d[:, 1:, :] - chi_3d[:, :-1, :])**2)
-    ddz = jnp.sum((chi_3d[1:, :, :] - chi_3d[:-1, :, :])**2)
-    return (ddx + ddy + ddz) / chi.size
-
-def smallness_loss(chi):
-    return jnp.mean(((chi - CHI_REF) / CHI_NORM)**2)
-
-def loss_fn(params, encoder, dec_susc, dec_ilr,
-            mag_grid, mag_observed,
-            train_coords_norm, train_ilr, train_cell_idx,
-            rng_key, lambda_recon, lambda_physics, lambda_kl,
-            lambda_smooth, lambda_small):
-    mu, log_var = encoder.apply(params['encoder'], mag_grid)
-    std = jnp.exp(0.5 * log_var)
-    z = mu + std * random.normal(rng_key, mu.shape)
-
-    chi_pred = dec_susc.apply(params['dec_susc'], z)
-    mag_pred = forward_magnetic_jax(chi_pred)
-
-    loss_physics = jnp.mean((mag_pred - mag_observed)**2) / jnp.var(mag_observed)
-    loss_smooth = smoothness_loss(chi_pred, nx, ny, nz)
-    loss_small = smallness_loss(chi_pred)
-
-    chi_at_train = chi_pred[train_cell_idx]
-    def predict_ilr(coord, chi_local):
-        return dec_ilr.apply(params['dec_ilr'], z, coord, chi_local)
-    ilr_pred = vmap(predict_ilr)(train_coords_norm, chi_at_train)
-    loss_recon = jnp.mean((ilr_pred - train_ilr)**2)
-
-    loss_kl = -0.5 * jnp.mean(1 + log_var - mu**2 - jnp.exp(log_var))
-
-    loss_total = (lambda_recon * loss_recon + lambda_kl * loss_kl
-                  + lambda_physics * loss_physics
-                  + lambda_smooth * loss_smooth + lambda_small * loss_small)
-
-    return loss_total, {
-        'total': loss_total, 'recon': loss_recon, 'kl': loss_kl,
-        'physics': loss_physics, 'smooth': loss_smooth, 'small': loss_small,
-        'chi_mean': jnp.mean(chi_pred), 'chi_max': jnp.max(chi_pred)
-    }
-
-rng = random.PRNGKey(42)
-rng, *init_rngs = random.split(rng, 4)
-
-latent_dim = 16
-encoder = Encoder(latent_dim=latent_dim)
-dec_susc = DecoderSusceptibility(n_cells=n_cells)
-dec_ilr = DecoderILR()
-
-params = {
-    'encoder': encoder.init(init_rngs[0], jnp.zeros((n_stations, n_stations))),
-    'dec_susc': dec_susc.init(init_rngs[1], jnp.zeros(latent_dim)),
-    'dec_ilr': dec_ilr.init(init_rngs[2], jnp.zeros(latent_dim), jnp.zeros(3), jnp.float32(0.0))
+# ============================================================
+# 3. INIT
+# ============================================================
+ldim=32
+rng=random.PRNGKey(42); rng,*ks=random.split(rng,5)
+enc=Encoder(latent_dim=ldim)
+ds=DecSusc(); dd=DecDens(); di=DecILR()
+dz_=jnp.zeros(ldim)
+dc_=jnp.zeros(3)
+params={
+    'enc':enc.init(ks[0],jnp.zeros((n_st,n_st)),jnp.zeros((n_st,n_st)),jnp.zeros((ny,nx,n_bands)),jnp.zeros((ny,nx,5))),
+    'ds':ds.init(ks[1],dz_,dc_),
+    'dd':dd.init(ks[2],dz_,dc_),
+    'di':di.init(ks[3],dz_,dc_,jnp.float32(0.),jnp.float32(0.)),
 }
 
-mag_grid = jnp.array(mag_observed.reshape(n_stations, n_stations))
-mag_grid_norm = (mag_grid - mag_grid.mean()) / (mag_grid.std() + 1e-6)
-mag_obs_jax = jnp.array(mag_observed)
+mg=jnp.array(mag_obs_np.reshape(n_st,n_st)); mg_n=(mg-mg.mean())/(mg.std()+1e-6)
+gg=jnp.array(grav_obs_np.reshape(n_st,n_st)); gg_n=(gg-gg.mean())/(gg.std()+1e-6)
+hj=jnp.array(hyper_img); gj=jnp.array(geochem_2d)
+mo=jnp.array(mag_obs_np); go=jnp.array(grav_obs_np)
 
-coord_mean = jnp.array([nx*dx/2, ny*dy/2, -nz*dz/2])
-coord_std = jnp.array([nx*dx/2, ny*dy/2, nz*dz/2])
-train_coords_norm = jnp.array((df_train[['x', 'y', 'z']].values - np.array(coord_mean)) / np.array(coord_std))
-train_ilr = jnp.array(df_train[['ilr0', 'ilr1', 'ilr2']].values)
-train_cell_idx = jnp.array(df_train['cell_idx'].values, dtype=jnp.int32)
-val_coords_norm = jnp.array((df_val[['x', 'y', 'z']].values - np.array(coord_mean)) / np.array(coord_std))
-val_ilr = jnp.array(df_val[['ilr0', 'ilr1', 'ilr2']].values)
-val_cell_idx = jnp.array(df_val['cell_idx'].values, dtype=jnp.int32)
+cm=jnp.array([nx*dx/2,ny*dy/2,-nz*dz/2]); cs=jnp.array([nx*dx/2,ny*dy/2,nz*dz/2])
+all_coords_norm=jnp.array((cc-np.array(cm))/np.array(cs))
+tcn=jnp.array((df_tr[['x','y','z']].values-np.array(cm))/np.array(cs))
+tilr=jnp.array(df_tr[['ilr0','ilr1','ilr2']].values)
+tidx=jnp.array(df_tr['cell_idx'].values,dtype=jnp.int32)
+vcn=jnp.array((df_va[['x','y','z']].values-np.array(cm))/np.array(cs))
+vilr=jnp.array(df_va[['ilr0','ilr1','ilr2']].values)
+vidx=jnp.array(df_va['cell_idx'].values,dtype=jnp.int32)
 
-# v3 config with lambda_recon=5 and 8000 epochs
-print("=== Training v8 (8000 epochs) ===")
-print("lambda_recon=5.0, lambda_physics=1.0, lambda_smooth=0.1, lambda_small=0.05")
+# ============================================================
+# 4. LOSS + TRAIN
+# ============================================================
+def loss_fn(params, rng_key, lam_recon, lam_mag, lam_grav, lam_kl):
+    mu,lv=enc.apply(params['enc'],mg_n,gg_n,hj,gj)
+    z=mu  # deterministic
 
-n_epochs = 8000
-schedule = optax.warmup_cosine_decay_schedule(
-    init_value=1e-4, peak_value=1e-3, warmup_steps=300, decay_steps=n_epochs
-)
-optimizer = optax.adam(schedule)
-opt_state = optimizer.init(params)
+    # Decode chi and rho for ALL cells (coordinate-conditioned)
+    chi=vmap(lambda c:ds.apply(params['ds'],z,c))(all_coords_norm)
+    rho=vmap(lambda c:dd.apply(params['dd'],z,c))(all_coords_norm)
 
-kl_warmup = 1000
-kl_target = 0.01
+    # Forward models
+    lm=jnp.mean((G_mag@chi-mo)**2)/jnp.var(mo)
+    lg=jnp.mean((G_grav@rho-go)**2)/jnp.var(go)
 
-@jit
-def train_step(params, opt_state, rng_key, lambda_kl):
-    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-        params, encoder, dec_susc, dec_ilr,
-        mag_grid_norm, mag_obs_jax,
-        train_coords_norm, train_ilr, train_cell_idx,
-        rng_key,
-        lambda_recon=5.0,
-        lambda_physics=1.0,
-        lambda_kl=lambda_kl,
-        lambda_smooth=0.1,
-        lambda_small=0.05
-    )
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    params = optax.apply_updates(params, updates)
-    return params, opt_state, loss, aux
+    # ILR at borehole locations
+    ip=vmap(lambda c,ch,rh:di.apply(params['di'],z,c,ch,rh))(tcn,chi[tidx],rho[tidx])
+    lr=jnp.mean((ip-tilr)**2)
 
-for epoch in range(n_epochs):
-    rng, step_rng = random.split(rng)
-    lkl = jnp.float32(min(epoch / kl_warmup, 1.0) * kl_target)
-    params, opt_state, loss, aux = train_step(params, opt_state, step_rng, lkl)
-    if epoch % 1000 == 0:
-        print(f"Epoch {epoch:5d} | total={aux['total']:.4f} | recon={aux['recon']:.4f} | "
-              f"phys={aux['physics']:.4f} | smooth={aux['smooth']:.4f} | "
-              f"small={aux['small']:.4f} | χ_max={aux['chi_max']:.4f}")
+    # KL
+    lk=-0.5*jnp.mean(1+lv-mu**2-jnp.exp(lv))
 
-print("\n=== Evaluation ===")
-mu, log_var = encoder.apply(params['encoder'], mag_grid_norm)
-chi_pred = dec_susc.apply(params['dec_susc'], mu)
-chi_pred_np = np.array(chi_pred)
+    tot=lam_recon*lr+lam_mag*lm+lam_grav*lg+lam_kl*lk
+    return tot,{'total':tot,'recon':lr,'kl':lk,'mag':lm,'grav':lg,
+                'chi_max':jnp.max(chi),'rho_max':jnp.max(rho)}
 
-all_coords_norm = jnp.array((cc - np.array(coord_mean)) / np.array(coord_std))
-def predict_all(coord, chi_local):
-    return dec_ilr.apply(params['dec_ilr'], mu, coord, chi_local)
-ilr_pred_all = np.array(vmap(predict_all)(all_coords_norm, chi_pred))
-comp_pred = ilr_inverse(ilr_pred_all)
-Cu_pred = comp_pred[:, 0]
+n_epochs=25000
+sched=optax.warmup_cosine_decay_schedule(init_value=1e-4,peak_value=2e-3,warmup_steps=500,decay_steps=n_epochs)
+opt=optax.adam(sched); ost=opt.init(params)
 
-def r2(y_true, y_pred):
-    ss_res = np.sum((y_true - y_pred)**2)
-    ss_tot = np.sum((y_true - y_true.mean())**2)
-    return 1 - ss_res / ss_tot
+@jax.jit
+def step(params,ost,rng_key):
+    (l,a),g=jax.value_and_grad(loss_fn,has_aux=True)(
+        params,rng_key,10.0,1.0,0.3,0.0)
+    u,ost=opt.update(g,ost,params)
+    return optax.apply_updates(params,u),ost,l,a
 
-chi_r2 = r2(susceptibility_true, chi_pred_np)
-cu_r2 = r2(Cu, Cu_pred)
-cu_corr = np.corrcoef(Cu, Cu_pred)[0, 1]
+print("\nTraining 25000 epochs (coord-conditioned, low grav)...")
+t0=time.time()
+for ep in range(n_epochs):
+    rng,sr=random.split(rng)
+    params,ost,_,aux=step(params,ost,sr)
+    if ep%2500==0:
+        print(f"  {ep:4d} | tot={aux['total']:.4f} rec={aux['recon']:.4f} mag={aux['mag']:.4f} "
+              f"grav={aux['grav']:.4f} "
+              f"chi_max={aux['chi_max']:.5f} rho_max={aux['rho_max']:.5f}")
+print(f"Done in {time.time()-t0:.0f}s")
 
-chi_at_val = chi_pred[val_cell_idx]
-val_pred = np.array(vmap(predict_all)(val_coords_norm, chi_at_val))
-val_rmse = float(np.sqrt(np.mean((val_pred - np.array(val_ilr))**2)))
-chi_at_train = chi_pred[train_cell_idx]
-tr_pred = np.array(vmap(predict_all)(train_coords_norm, chi_at_train))
-tr_rmse = float(np.sqrt(np.mean((tr_pred - np.array(train_ilr))**2)))
+# ============================================================
+# 5. EVALUATE
+# ============================================================
+mu,_=enc.apply(params['enc'],mg_n,gg_n,hj,gj)
+chi_p=np.array(vmap(lambda c:ds.apply(params['ds'],mu,c))(all_coords_norm))
+rho_p=np.array(vmap(lambda c:dd.apply(params['dd'],mu,c))(all_coords_norm))
 
-print(f"χ pred: {chi_pred_np.min():.4f} – {chi_pred_np.max():.4f} (true: {susceptibility_true.min():.4f} – {susceptibility_true.max():.4f})")
-print(f"Cu pred: {Cu_pred.min()*100:.2f}% – {Cu_pred.max()*100:.2f}% (true: {Cu.min()*100:.2f}% – {Cu.max()*100:.2f}%)")
-print(f"\n=== RESULTS ===")
-print(f"χ R²:           {chi_r2:.4f}")
-print(f"Cu R² (global): {cu_r2:.4f}")
-print(f"Cu correlation: {cu_corr:.4f}")
-print(f"ILR train RMSE: {tr_rmse:.4f}")
-print(f"ILR val RMSE:   {val_rmse:.4f}")
+def r2(t,p): return 1-np.sum((t-p)**2)/np.sum((t-t.mean())**2)
+print(f"\nchi R²={r2(susceptibility_true,chi_p):.4f}  range: {chi_p.min():.5f}-{chi_p.max():.5f} (true: {susceptibility_true.min():.5f}-{susceptibility_true.max():.5f})")
+print(f"rho R²={r2(density_true,rho_p):.4f}  range: {rho_p.min():.4f}-{rho_p.max():.4f} (true: {density_true.min():.4f}-{density_true.max():.4f})")
 
-if cu_r2 > 0.0 and cu_corr > 0.6:
-    print("\n>>> GOOD: Cu R² positive and correlation > 0.6")
-elif cu_corr > 0.5:
-    print(f"\n>>> DECENT: correlation > 0.5 but Cu R² = {cu_r2:.4f}")
-else:
-    print(f"\n>>> NEEDS WORK")
+ilr_all=np.array(vmap(lambda c,ch,rh:di.apply(params['di'],mu,c,ch,rh))(all_coords_norm,jnp.array(chi_p),jnp.array(rho_p)))
+Cu_p=ilr_inverse(ilr_all)[:,0]
+print(f"Cu R²={r2(Cu,Cu_p):.4f}  corr={np.corrcoef(Cu,Cu_p)[0,1]:.4f}  range: {Cu_p.min()*100:.2f}%-{Cu_p.max()*100:.2f}% (true: {Cu.min()*100:.2f}%-{Cu.max()*100:.2f}%)")
+
+# Val
+vp=np.array(vmap(lambda c,ch,rh:di.apply(params['di'],mu,c,ch,rh))(vcn,jnp.array(chi_p)[vidx],jnp.array(rho_p)[vidx]))
+print(f"Val ILR RMSE={float(np.sqrt(np.mean((vp-np.array(vilr))**2))):.4f}")
+
+print(f"\n--- Loss breakdown ---")
+for k in ['recon','mag','grav','kl']:
+    print(f"  {k:10s}: {float(aux[k]):.6f}")

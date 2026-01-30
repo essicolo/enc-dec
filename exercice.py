@@ -28,33 +28,36 @@
 #                └──────────────┘  │    │  MLP    │       │
 #                ┌──────────────┐  │    └─────────┘       │
 # Hyperspectral ▶│ CNN Branch 3 │──┤                      │
-#  (10 bands)    └──────────────┘  │           ┌──────────┼──────────────────────────┐
-#                ┌──────────────┐  │           │          │          │               │
-# Geochemistry ─▶│ CNN Branch 4 │──┘           ▼          ▼          ▼               ▼
-#  (gridded)     └──────────────┘     ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
-#                                     │DEC_SUSC  │ │DEC_DENS  │ │DEC_HYPER │ │DEC_GEOCH │
-#                                     │z → χ(3D) │ │z → Δρ(3D)│ │z → refl. │ │z → soil  │
-#                                     └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘
-#                                          │  ┌─────────┘            │             │
-#                   ┌──────────────────────┐▼  ▼                     ▼             ▼
-#                   │      DECODER_ILR     │         Loss hyper.   Loss geochem.
-#                   │ z + χ + Δρ + (x,y,z) │
-#                   │       → ILR          │
-#                   └──────────┬───────────┘
-#              ┌───────────────┼───────────────┐
-#              ▼               ▼               ▼
-#       ┌────────────┐ ┌────────────┐  ┌──────────────┐
-#       │ FORWARD MAG│ │FORWARD GRAV│  │Loss reconstr.│
-#       │  G_mag @ χ │ │ G_grav @ Δρ│  │(vs boreholes)│
-#       └─────┬──────┘ └─────┬──────┘  └──────────────┘
-#             ▼              ▼
-#       Loss magnetics  Loss gravity
+#  (10 bands)    └──────────────┘  │    For each cell (x,y,z):
+#                ┌──────────────┐  │    ┌───────────────────────────────┐
+# Geochemistry ─▶│ CNN Branch 4 │──┘    │         (z, coord)            │
+#  (gridded)     └──────────────┘       │  ┌──────────┐ ┌──────────┐   │
+#                                       │  │DEC_SUSC  │ │DEC_DENS  │   │
+#                                       │  │→ χ_local │ │→ ρ_local │   │
+#                                       │  └────┬─────┘ └────┬─────┘   │
+#                                       │       ▼            ▼         │
+#                                       │  ┌──────────────────────┐    │
+#                                       │  │     DECODER_ILR      │    │
+#                                       │  │ z+coord+χ+ρ → ILR   │    │
+#                                       │  └──────────┬───────────┘    │
+#                                       └─────────────┼────────────────┘
+#                            ┌────────────┬───────────┘
+#                            ▼            ▼
+#                     ┌────────────┐ ┌────────────┐  ┌──────────────┐
+#                     │ FORWARD MAG│ │FORWARD GRAV│  │Loss reconstr.│
+#                     │  G_mag @ χ │ │ G_grav @ Δρ│  │(vs boreholes)│
+#                     └─────┬──────┘ └─────┬──────┘  └──────────────┘
+#                           ▼              ▼
+#                     Loss magnetics  Loss gravity
 # ```
 #
-# **Joint inversion**: the shared latent space forces consistency across
-# all 6 data-driven losses. Every sensor constrains z — no free inputs.
-# Physics-informed losses (magnetics, gravity) ensure geophysical consistency.
-# Surface decoders ensure z captures alteration and geochemical patterns.
+# **Key design choices**:
+# 1. Surface sensors are encoder inputs only — no decoder losses on them
+#    (avoids parasitic autoencoder shortcuts).
+# 2. Coordinate-conditioned decoders (NeRF-style): each cell gets (z, x, y, z)
+#    → chi/rho, with shared weights providing implicit spatial regularization.
+# 3. Deterministic encoder (no VAE sampling) — KL loss fights recon loss
+#    in single-scene problems.
 
 # %% [markdown]
 # ## Setup
@@ -422,11 +425,9 @@ print(f"Forward gravity:   {float(grav_test.min()):.4f} – {float(grav_test.max
 # Two physical property decoders + one composition decoder.
 
 # %%
-# Normalization constants — bring regularization losses to O(1)
-CHI_NORM = 0.01    # susceptibility characteristic scale
-CHI_REF = 0.001    # background susceptibility
-RHO_NORM = 0.1     # density contrast characteristic scale
-RHO_REF = 0.0      # background density contrast
+# No explicit normalization constants needed — the coordinate-conditioned
+# decoders use softplus * scale directly, and chi/rho enter the ILR decoder
+# as chi*100 and rho*10 for numerical balance.
 
 # %%
 class MultiModalEncoder(nn.Module):
@@ -489,35 +490,41 @@ class MultiModalEncoder(nn.Module):
 
 
 class DecoderSusceptibility(nn.Module):
-    """Latent → magnetic susceptibility χ (positive, 3D field)"""
-    n_cells: int
+    """
+    (latent, coord_norm) → χ_local (scalar).
+    Coordinate-conditioned decoder (NeRF-style): each cell gets
+    a position-dependent prediction from the shared latent vector.
+    Weight sharing across all cells provides implicit spatial regularization.
+    """
 
     @nn.compact
-    def __call__(self, latent):
-        x = nn.Dense(128)(latent)
+    def __call__(self, latent, coord_norm):
+        x = jnp.concatenate([latent, coord_norm])
+        x = nn.Dense(128)(x)
         x = nn.relu(x)
-        x = nn.Dense(256)(x)
+        x = nn.Dense(64)(x)
         x = nn.relu(x)
-        x = nn.Dense(512)(x)
+        x = nn.Dense(32)(x)
         x = nn.relu(x)
-        raw = nn.Dense(self.n_cells)(x)
-        return nn.softplus(raw) * 0.01
+        return nn.softplus(nn.Dense(1)(x).squeeze()) * 0.01
 
 
 class DecoderDensity(nn.Module):
-    """Latent → density contrast Δρ (positive for sulfide ore, 3D field)"""
-    n_cells: int
+    """
+    (latent, coord_norm) → Δρ_local (scalar).
+    Same coordinate-conditioned architecture as susceptibility decoder.
+    """
 
     @nn.compact
-    def __call__(self, latent):
-        x = nn.Dense(128)(latent)
+    def __call__(self, latent, coord_norm):
+        x = jnp.concatenate([latent, coord_norm])
+        x = nn.Dense(128)(x)
         x = nn.relu(x)
-        x = nn.Dense(256)(x)
+        x = nn.Dense(64)(x)
         x = nn.relu(x)
-        x = nn.Dense(512)(x)
+        x = nn.Dense(32)(x)
         x = nn.relu(x)
-        raw = nn.Dense(self.n_cells)(x)
-        return nn.softplus(raw) * 0.1
+        return nn.softplus(nn.Dense(1)(x).squeeze()) * 0.1
 
 
 class DecoderILR(nn.Module):
@@ -529,10 +536,9 @@ class DecoderILR(nn.Module):
 
     @nn.compact
     def __call__(self, latent, coord_norm, chi_local, rho_local):
-        chi_n = chi_local / CHI_NORM
-        rho_n = rho_local / RHO_NORM
-        x = jnp.concatenate([latent, jnp.atleast_1d(chi_n),
-                             jnp.atleast_1d(rho_n), coord_norm])
+        x = jnp.concatenate([latent, coord_norm,
+                             jnp.atleast_1d(chi_local * 100),
+                             jnp.atleast_1d(rho_local * 10)])
         x = nn.Dense(64)(x)
         x = nn.relu(x)
         x = nn.Dense(32)(x)
@@ -540,96 +546,51 @@ class DecoderILR(nn.Module):
         return nn.Dense(3)(x)
 
 
-class DecoderHyperspectral(nn.Module):
-    """
-    Latent → predicted surface reflectance image (ny × nx × n_bands).
-    The latent must encode enough information to reconstruct the
-    surface alteration pattern observed by the hyperspectral sensor.
-    """
-    ny: int
-    nx: int
-    n_bands: int
-
-    @nn.compact
-    def __call__(self, latent):
-        x = nn.Dense(256)(latent)
-        x = nn.relu(x)
-        x = nn.Dense(512)(x)
-        x = nn.relu(x)
-        x = nn.Dense(self.ny * self.nx * self.n_bands)(x)
-        return nn.sigmoid(x).reshape(self.ny, self.nx, self.n_bands)
-
-
-class DecoderGeochem(nn.Module):
-    """
-    Latent → predicted surface geochemistry grid (ny × nx × n_elements).
-    Reconstructs the interpolated soil geochemistry (normalized to [0,1]).
-    """
-    ny: int
-    nx: int
-    n_elements: int
-
-    @nn.compact
-    def __call__(self, latent):
-        x = nn.Dense(256)(latent)
-        x = nn.relu(x)
-        x = nn.Dense(self.ny * self.nx * self.n_elements)(x)
-        return nn.sigmoid(x).reshape(self.ny, self.nx, self.n_elements)
+# NOTE: We deliberately do NOT add decoders for hyperspectral and geochemistry.
+# These surface observations are encoder inputs only. Adding decoder losses
+# on them creates a parasitic autoencoder shortcut: the encoder sees the data
+# and a decoder reconstructs that same data → trivially minimized without
+# learning anything about the subsurface. The latent space must be shaped
+# by SUBSURFACE targets (forward models + borehole compositions).
 
 # %% [markdown]
 # ---
-# # Part 5: Multi-Physics + Multi-Sensor Loss Function
+# # Part 5: Multi-Physics Loss Function
 #
-# Every data source contributes a loss term — no free inputs:
+# Loss targets are SUBSURFACE quantities only:
 # - **Magnetics / Gravity**: physics-based forward model losses (G @ property)
-# - **Hyperspectral / Geochemistry**: learned decoder reconstruction losses
 # - **Drill holes**: ILR composition reconstruction loss
+#
+# No explicit smoothness/smallness regularization is needed: the
+# coordinate-conditioned MLP decoders share weights across all cells,
+# providing implicit spatial regularization (similar to NeRF).
 
 # %%
-def smoothness_loss(field, nx, ny, nz, norm):
-    """Finite-difference smoothness on a normalized 3D field."""
-    f = field / norm
-    f3d = f.reshape(nz, ny, nx)
-    dx = jnp.sum((f3d[:, :, 1:] - f3d[:, :, :-1])**2)
-    dy = jnp.sum((f3d[:, 1:, :] - f3d[:, :-1, :])**2)
-    dz = jnp.sum((f3d[1:, :, :] - f3d[:-1, :, :])**2)
-    return (dx + dy + dz) / field.size
-
-def smallness_loss(field, ref, norm):
-    """Penalize deviation from background value (normalized)."""
-    return jnp.mean(((field - ref) / norm)**2)
-
-
 def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
-            dec_hyper, dec_geochem,
             mag_grid, grav_grid, hyper_img, geochem_grid,
             mag_observed, grav_observed,
-            hyper_observed, geochem_observed,
-            train_coords_norm, train_ilr, train_cell_idx,
+            all_coords_norm, train_coords_norm, train_ilr, train_cell_idx,
             rng_key,
-            lambda_recon=5.0, lambda_mag=1.0, lambda_grav=1.0,
-            lambda_hyper=1.0, lambda_geochem=1.0,
-            lambda_kl=0.01, lambda_smooth=0.1, lambda_small=0.05):
+            lambda_recon=10.0, lambda_mag=1.0, lambda_grav=0.3):
     """
-    Multi-physics + multi-sensor loss. Every data source has a loss:
+    Multi-physics loss with subsurface-only targets:
     - Magnetic forward:    ||G_mag @ χ - mag_obs||² / var      (physics)
     - Gravity forward:     ||G_grav @ Δρ - grav_obs||² / var   (physics)
-    - Hyperspectral:       ||dec_hyper(z) - hyper_obs||²        (surface)
-    - Geochemistry:        ||dec_geochem(z) - geochem_obs||²    (surface)
     - ILR reconstruction:  ||dec_ilr(z,χ,ρ,xyz) - ilr_obs||²   (borehole)
-    - KL divergence + smoothness + smallness regularization
+
+    Surface data (hyperspectral, geochemistry) are encoder inputs only —
+    NO decoder losses on them (avoids parasitic autoencoder shortcuts).
+    Deterministic encoder (no VAE sampling / KL) — avoids KL fighting recon.
     """
 
-    # --- Encode ---
+    # --- Encode (all 4 surface sensors) → deterministic latent ---
     mu, log_var = encoder.apply(params['encoder'],
                                 mag_grid, grav_grid, hyper_img, geochem_grid)
-    std = jnp.exp(0.5 * log_var)
-    eps = random.normal(rng_key, mu.shape)
-    z = mu + std * eps
+    z = mu  # deterministic — no sampling, no KL
 
-    # --- Decode physical properties ---
-    chi_pred = dec_susc.apply(params['dec_susc'], z)
-    rho_pred = dec_dens.apply(params['dec_dens'], z)
+    # --- Decode physical properties at ALL cell locations ---
+    chi_pred = vmap(lambda c: dec_susc.apply(params['dec_susc'], z, c))(all_coords_norm)
+    rho_pred = vmap(lambda c: dec_dens.apply(params['dec_dens'], z, c))(all_coords_norm)
 
     # --- Forward models (PINN) — geophysical consistency ---
     mag_pred = forward_magnetic_jax(chi_pred)
@@ -637,19 +598,6 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
 
     loss_mag = jnp.mean((mag_pred - mag_observed)**2) / jnp.var(mag_observed)
     loss_grav = jnp.mean((grav_pred - grav_observed)**2) / jnp.var(grav_observed)
-
-    # --- Surface consistency — hyperspectral + geochemistry ---
-    hyper_pred = dec_hyper.apply(params['dec_hyper'], z)
-    geochem_pred = dec_geochem.apply(params['dec_geochem'], z)
-
-    loss_hyper = jnp.mean((hyper_pred - hyper_observed)**2)
-    loss_geochem = jnp.mean((geochem_pred - geochem_observed)**2)
-
-    # --- Regularization (both fields) ---
-    loss_smooth = (smoothness_loss(chi_pred, nx, ny, nz, CHI_NORM) +
-                   smoothness_loss(rho_pred, nx, ny, nz, RHO_NORM))
-    loss_small = (smallness_loss(chi_pred, CHI_REF, CHI_NORM) +
-                  smallness_loss(rho_pred, RHO_REF, RHO_NORM))
 
     # --- Decode ILR at drill hole locations ---
     chi_at_train = chi_pred[train_cell_idx]
@@ -661,24 +609,14 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
     ilr_pred = vmap(predict_ilr)(train_coords_norm, chi_at_train, rho_at_train)
     loss_recon = jnp.mean((ilr_pred - train_ilr)**2)
 
-    # --- KL divergence ---
-    loss_kl = -0.5 * jnp.mean(1 + log_var - mu**2 - jnp.exp(log_var))
-
     # --- Total ---
     loss_total = (lambda_recon * loss_recon
-                  + lambda_kl * loss_kl
                   + lambda_mag * loss_mag
-                  + lambda_grav * loss_grav
-                  + lambda_hyper * loss_hyper
-                  + lambda_geochem * loss_geochem
-                  + lambda_smooth * loss_smooth
-                  + lambda_small * loss_small)
+                  + lambda_grav * loss_grav)
 
     return loss_total, {
         'total': loss_total, 'recon': loss_recon,
-        'kl': loss_kl, 'mag': loss_mag, 'grav': loss_grav,
-        'hyper': loss_hyper, 'geochem': loss_geochem,
-        'smooth': loss_smooth, 'small': loss_small,
+        'mag': loss_mag, 'grav': loss_grav,
         'chi_max': jnp.max(chi_pred), 'rho_max': jnp.max(rho_pred)
     }
 
@@ -689,15 +627,13 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
 # %%
 # Initialize all modules
 rng = random.PRNGKey(42)
-rng, *init_rngs = random.split(rng, 7)
+rng, *init_rngs = random.split(rng, 5)
 
 latent_dim = 32
 encoder = MultiModalEncoder(latent_dim=latent_dim)
-dec_susc = DecoderSusceptibility(n_cells=n_cells)
-dec_dens = DecoderDensity(n_cells=n_cells)
+dec_susc = DecoderSusceptibility()
+dec_dens = DecoderDensity()
 dec_ilr = DecoderILR()
-dec_hyper = DecoderHyperspectral(ny=ny, nx=nx, n_bands=n_bands)
-dec_geochem = DecoderGeochem(ny=ny, nx=nx, n_elements=5)
 
 # Dummy inputs for initialization
 dummy_mag = jnp.zeros((n_stations_mag, n_stations_mag))
@@ -711,11 +647,9 @@ dummy_rho = jnp.float32(0.0)
 
 params = {
     'encoder': encoder.init(init_rngs[0], dummy_mag, dummy_grav, dummy_hyper, dummy_geochem),
-    'dec_susc': dec_susc.init(init_rngs[1], dummy_latent),
-    'dec_dens': dec_dens.init(init_rngs[2], dummy_latent),
+    'dec_susc': dec_susc.init(init_rngs[1], dummy_latent, dummy_coord),
+    'dec_dens': dec_dens.init(init_rngs[2], dummy_latent, dummy_coord),
     'dec_ilr': dec_ilr.init(init_rngs[3], dummy_latent, dummy_coord, dummy_chi, dummy_rho),
-    'dec_hyper': dec_hyper.init(init_rngs[4], dummy_latent),
-    'dec_geochem': dec_geochem.init(init_rngs[5], dummy_latent)
 }
 
 # %%
@@ -732,13 +666,10 @@ geochem_grid_jax = jnp.array(geochem_grid_2d)
 mag_obs_jax = jnp.array(mag_observed)
 grav_obs_jax = jnp.array(grav_observed)
 
-# Surface observations for consistency losses
-hyper_obs_jax = jnp.array(hyper_image)       # (16, 16, 10) already in [0,1]
-geochem_obs_jax = jnp.array(geochem_grid_2d) # (16, 16, 5) already normalized to [0,1]
-
-# Drill hole coordinates (normalized)
+# Coordinates (normalized) — for all cells and drill holes
 coord_mean = jnp.array([nx*dx/2, ny*dy/2, -nz*dz/2])
 coord_std = jnp.array([nx*dx/2, ny*dy/2, nz*dz/2])
+all_coords_norm = jnp.array((cc - np.array(coord_mean)) / np.array(coord_std))
 train_coords_norm = jnp.array((df_train[['x', 'y', 'z']].values - np.array(coord_mean)) / np.array(coord_std))
 train_ilr = jnp.array(df_train[['ilr0', 'ilr1', 'ilr2']].values)
 train_cell_idx = jnp.array(df_train['cell_idx'].values, dtype=jnp.int32)
@@ -751,38 +682,27 @@ print("Data prepared for training")
 
 # %%
 # Optimizer with warmup cosine decay
-n_epochs = 8000
+n_epochs = 12000
 schedule = optax.warmup_cosine_decay_schedule(
     init_value=1e-4,
-    peak_value=1e-3,
-    warmup_steps=300,
+    peak_value=2e-3,
+    warmup_steps=500,
     decay_steps=n_epochs
 )
 optimizer = optax.adam(schedule)
 opt_state = optimizer.init(params)
 
-# KL annealing
-kl_warmup_epochs = 1000
-kl_target = 0.01
-
 @jit
-def train_step(params, opt_state, rng_key, lambda_kl):
+def train_step(params, opt_state, rng_key):
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
         params, encoder, dec_susc, dec_dens, dec_ilr,
-        dec_hyper, dec_geochem,
         mag_grid_norm, grav_grid_norm, hyper_img_jax, geochem_grid_jax,
         mag_obs_jax, grav_obs_jax,
-        hyper_obs_jax, geochem_obs_jax,
-        train_coords_norm, train_ilr, train_cell_idx,
+        all_coords_norm, train_coords_norm, train_ilr, train_cell_idx,
         rng_key,
-        lambda_recon=5.0,
+        lambda_recon=10.0,
         lambda_mag=1.0,
-        lambda_grav=1.0,
-        lambda_hyper=1.0,
-        lambda_geochem=1.0,
-        lambda_kl=lambda_kl,
-        lambda_smooth=0.1,
-        lambda_small=0.05
+        lambda_grav=0.3
     )
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
@@ -794,15 +714,13 @@ history = []
 
 for epoch in range(n_epochs):
     rng, step_rng = random.split(rng)
-    lambda_kl = jnp.float32(min(epoch / kl_warmup_epochs, 1.0) * kl_target)
 
-    params, opt_state, loss, aux = train_step(params, opt_state, step_rng, lambda_kl)
+    params, opt_state, loss, aux = train_step(params, opt_state, step_rng)
     history.append({**{k: float(v) for k, v in aux.items()}, 'epoch': epoch})
 
     if epoch % 1000 == 0:
         print(f"Epoch {epoch:4d} | loss={aux['total']:.4f} | recon={aux['recon']:.4f} | "
               f"mag={aux['mag']:.4f} | grav={aux['grav']:.4f} | "
-              f"hyper={aux['hyper']:.4f} | geochem={aux['geochem']:.4f} | "
               f"χ_max={aux['chi_max']:.4f} | ρ_max={aux['rho_max']:.4f}")
 
 # %%
@@ -814,10 +732,6 @@ df_hist = pd.DataFrame(history)
     + lp.geom_line(lp.aes(y='recon'), color="#962561")
     + lp.geom_line(lp.aes(y='mag'), color="#abc000")
     + lp.geom_line(lp.aes(y='grav'), color="#006080")
-    + lp.geom_line(lp.aes(y='hyper'), color="#e94560")
-    + lp.geom_line(lp.aes(y='geochem'), color="#f5a623")
-    + lp.geom_line(lp.aes(y='smooth'), color="#00abc0")
-    + lp.geom_line(lp.aes(y='small'), color="#c06000")
     + lp.scale_y_log10()
     + lp.labs(title='Training losses', x='Epoch', y='Loss (log)')
 )
@@ -832,9 +746,9 @@ mu, log_var = encoder.apply(params['encoder'],
                             mag_grid_norm, grav_grid_norm,
                             hyper_img_jax, geochem_grid_jax)
 
-# Decode physical properties
-chi_pred = dec_susc.apply(params['dec_susc'], mu)
-rho_pred = dec_dens.apply(params['dec_dens'], mu)
+# Decode physical properties at all cell locations
+chi_pred = vmap(lambda c: dec_susc.apply(params['dec_susc'], mu, c))(all_coords_norm)
+rho_pred = vmap(lambda c: dec_dens.apply(params['dec_dens'], mu, c))(all_coords_norm)
 chi_pred_np = np.array(chi_pred)
 rho_pred_np = np.array(rho_pred)
 
@@ -853,28 +767,27 @@ print(f"Grav predicted: {float(grav_from_pred.min()):.4f} – {float(grav_from_p
 print(f"Grav observed:  {grav_observed.min():.4f} – {grav_observed.max():.4f} mGal")
 
 # %% [markdown]
-# ## Predict compositions with uncertainty (posterior sampling)
+# ## Predict compositions with uncertainty (latent perturbation)
 
 # %%
-all_coords_norm = (cc - np.array(coord_mean)) / np.array(coord_std)
-all_coords_norm_jax = jnp.array(all_coords_norm)
-
+# Since we use deterministic encoding, we estimate uncertainty
+# by perturbing the latent vector with small noise.
 n_samples = 100
 ilr_samples = []
+perturbation_scale = 0.1
 
 for i in range(n_samples):
     rng, sample_rng = random.split(rng)
-    std = jnp.exp(0.5 * log_var)
     eps = random.normal(sample_rng, mu.shape)
-    z = mu + std * eps
+    z = mu + perturbation_scale * eps
 
-    chi_sample = dec_susc.apply(params['dec_susc'], z)
-    rho_sample = dec_dens.apply(params['dec_dens'], z)
+    chi_sample = vmap(lambda c: dec_susc.apply(params['dec_susc'], z, c))(all_coords_norm)
+    rho_sample = vmap(lambda c: dec_dens.apply(params['dec_dens'], z, c))(all_coords_norm)
 
     def predict_ilr(coord, chi_local, rho_local):
         return dec_ilr.apply(params['dec_ilr'], z, coord, chi_local, rho_local)
 
-    ilr_sample = vmap(predict_ilr)(all_coords_norm_jax, chi_sample, rho_sample)
+    ilr_sample = vmap(predict_ilr)(all_coords_norm, chi_sample, rho_sample)
     ilr_samples.append(np.array(ilr_sample))
 
 ilr_samples = np.stack(ilr_samples)
@@ -896,10 +809,8 @@ print(f"Cu true:      {Cu.min()*100:.2f}% – {Cu.max()*100:.2f}%")
 
 # %%
 def predict_ilr_at_coords(mu_latent, coords_norm, cell_idx):
-    chi_val = dec_susc.apply(params['dec_susc'], mu_latent)
-    rho_val = dec_dens.apply(params['dec_dens'], mu_latent)
-    chi_at = chi_val[cell_idx]
-    rho_at = rho_val[cell_idx]
+    chi_at = chi_pred[cell_idx]
+    rho_at = rho_pred[cell_idx]
     def predict(coord, chi_l, rho_l):
         return dec_ilr.apply(params['dec_ilr'], mu_latent, coord, chi_l, rho_l)
     return vmap(predict)(coords_norm, chi_at, rho_at)
@@ -1067,15 +978,15 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 # data integration, where multiple heterogeneous data sources are fused
 # through a shared latent space for joint geophysical-geochemical inversion.
 #
-# ### Data Integration — Every Source Has a Loss
+# ### Data Integration
 #
-# | Source           | Information               | Encoder input  | Loss type                |
+# | Source           | Information               | Role           | Loss type                |
 # |------------------|---------------------------|----------------|--------------------------|
-# | Airborne mag     | Magnetic susceptibility   | CNN branch     | Physics: G_mag @ χ       |
-# | Ground gravity   | Density contrast          | CNN branch     | Physics: G_grav @ Δρ     |
-# | Hyperspectral    | Surface alteration        | CNN branch     | Decoder: z → reflectance |
-# | Soil geochemistry| Pathfinder elements       | CNN branch     | Decoder: z → soil grid   |
-# | Drill holes      | Direct Cu, Ni, Co assays  | (supervision)  | Decoder: z+χ+Δρ → ILR   |
+# | Airborne mag     | Magnetic susceptibility   | Encoder input  | Physics: G_mag @ χ       |
+# | Ground gravity   | Density contrast          | Encoder input  | Physics: G_grav @ Δρ     |
+# | Hyperspectral    | Surface alteration        | Encoder input  | (none — input only)      |
+# | Soil geochemistry| Pathfinder elements       | Encoder input  | (none — input only)      |
+# | Drill holes      | Direct Cu, Ni, Co assays  | Target only    | Decoder: z+χ+Δρ → ILR   |
 #
 # ### Key Design Choices
 #
@@ -1090,14 +1001,22 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 #    as inputs, creating a direct physical bridge between geophysical
 #    properties and mineral compositions.
 #
-# 3. **No free inputs — every sensor constrains z**: Magnetics and gravity
-#    use physics-based forward models (G matrices from SimPEG). Hyperspectral
-#    and geochemistry use learned decoders that must reconstruct the observed
-#    surface data from z. This ensures the latent space truly encodes
-#    information from all sensors, not just the ones with physics losses.
+# 3. **Surface inputs, subsurface targets**: Hyperspectral and geochemistry
+#    data enter through the encoder but have NO decoder losses. Adding
+#    decoder losses on encoder inputs creates a parasitic autoencoder
+#    shortcut: the network trivially memorizes surface data without
+#    learning subsurface structure. Only subsurface quantities (forward
+#    model predictions, borehole compositions) serve as training targets.
 #
-# 4. **Uncertainty quantification**: Posterior sampling from the VAE
-#    latent space propagates uncertainty through all decoders, providing
+# 4. **Coordinate-conditioned decoders (NeRF-style)**: Rather than
+#    decoding z → all 2048 cells at once, each cell is predicted from
+#    (z, x, y, z_coord). Weight sharing across cells provides implicit
+#    spatial regularization, and the network can learn position-dependent
+#    anomaly patterns. This approach resolves the non-uniqueness of
+#    geophysical inversion by integrating spatial structure.
+#
+# 5. **Uncertainty quantification**: Latent perturbation sampling
+#    propagates uncertainty through all decoders, providing
 #    spatially-varying confidence estimates for exploration targeting.
 #
 # ### Comparison to KoBold Metals' Approach
