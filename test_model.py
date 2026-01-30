@@ -210,6 +210,7 @@ cm=jnp.array([nx*dx/2,ny*dy/2,-nz*dz/2]); cs=jnp.array([nx*dx/2,ny*dy/2,nz*dz/2]
 all_coords_norm=jnp.array((cc-np.array(cm))/np.array(cs))
 tcn=jnp.array((df_tr[['x','y','z']].values-np.array(cm))/np.array(cs))
 tilr=jnp.array(df_tr[['ilr0','ilr1','ilr2']].values)
+tilr_std=jnp.std(tilr,axis=0)  # per-dimension std for loss normalization
 tidx=jnp.array(df_tr['cell_idx'].values,dtype=jnp.int32)
 vcn=jnp.array((df_va[['x','y','z']].values-np.array(cm))/np.array(cs))
 vilr=jnp.array(df_va[['ilr0','ilr1','ilr2']].values)
@@ -229,7 +230,7 @@ def loss_fn(params, rng_key, lam_recon, lam_mag, lam_grav):
     lg=jnp.mean((G_grav@rho-go)**2)/jnp.var(go)
 
     ip=vmap(lambda c,ch,rh:di.apply(params['di'],z,c,ch,rh))(tcn,chi[tidx],rho[tidx])
-    lr=jnp.mean((ip-tilr)**2)
+    lr=jnp.mean(((ip-tilr)/tilr_std)**2)  # normalized per-dimension
 
     # Soft upper bound penalty on rho — sum-based (not mean) to avoid dilution
     loss_rho_bound = jnp.sum(jnp.maximum(rho - 0.25, 0.0)**2)

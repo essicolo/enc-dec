@@ -624,7 +624,7 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
         return dec_ilr.apply(params['dec_ilr'], z, coord, chi_local, rho_local)
 
     ilr_pred = vmap(predict_ilr)(train_coords_norm, chi_at_train, rho_at_train)
-    loss_recon = jnp.mean((ilr_pred - train_ilr)**2)
+    loss_recon = jnp.mean(((ilr_pred - train_ilr) / train_ilr_std)**2)
 
     # --- Rho bounding penalty ---
     # safe_softplus gradient floor prevents rho from settling to zero,
@@ -697,6 +697,7 @@ coord_std = jnp.array([nx*dx/2, ny*dy/2, nz*dz/2])
 all_coords_norm = jnp.array((cc - np.array(coord_mean)) / np.array(coord_std))
 train_coords_norm = jnp.array((df_train[['x', 'y', 'z']].values - np.array(coord_mean)) / np.array(coord_std))
 train_ilr = jnp.array(df_train[['ilr0', 'ilr1', 'ilr2']].values)
+train_ilr_std = jnp.std(train_ilr, axis=0)  # per-dimension std for loss normalization
 train_cell_idx = jnp.array(df_train['cell_idx'].values, dtype=jnp.int32)
 
 val_coords_norm = jnp.array((df_val[['x', 'y', 'z']].values - np.array(coord_mean)) / np.array(coord_std))
