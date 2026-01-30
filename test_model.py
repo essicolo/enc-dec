@@ -113,6 +113,30 @@ print(f"Data ready: {n_st**2} mag/grav, {hyper_img.shape} hyper, {n_soil} soil, 
 # ============================================================
 # 2. MODEL — Coordinate-conditioned decoders (NeRF-style)
 # ============================================================
+
+# Custom softplus with minimum gradient to prevent gradient death.
+# Forward: standard softplus. Backward: gradient floor at 0.01.
+@jax.custom_vjp
+def safe_softplus(x):
+    return jax.nn.softplus(x)
+def _sp_fwd(x):
+    return jax.nn.softplus(x), x
+def _sp_bwd(x, g):
+    return (g * jnp.maximum(jax.nn.sigmoid(x), 0.01),)
+safe_softplus.defvjp(_sp_fwd, _sp_bwd)
+
+# Custom sigmoid with minimum gradient — structurally bounds output to [0,1].
+# Prevents gradient death at sigmoid extremes where derivative -> 0.
+@jax.custom_vjp
+def safe_sigmoid(x):
+    return jax.nn.sigmoid(x)
+def _ss_fwd(x):
+    return jax.nn.sigmoid(x), x
+def _ss_bwd(x, g):
+    s = jax.nn.sigmoid(x)
+    return (g * jnp.maximum(s * (1 - s), 0.01),)
+safe_sigmoid.defvjp(_ss_fwd, _ss_bwd)
+
 class Encoder(nn.Module):
     latent_dim: int=32
     @nn.compact
@@ -133,26 +157,24 @@ class Encoder(nn.Module):
         return nn.Dense(self.latent_dim)(f), nn.Dense(self.latent_dim)(f)
 
 class DecSusc(nn.Module):
-    """(z, coord_norm) → chi_local (scalar). Coordinate-conditioned.
-    softplus(0)*0.01 = 0.007 — between background (0.001) and anomaly (0.024)."""
+    """(z, coord_norm) → chi_local. safe_softplus prevents gradient death."""
     @nn.compact
     def __call__(self, z, coord):
         x=jnp.concatenate([z, coord])
         x=nn.relu(nn.Dense(128)(x))
         x=nn.relu(nn.Dense(64)(x))
         x=nn.relu(nn.Dense(32)(x))
-        return nn.softplus(nn.Dense(1)(x).squeeze()) * 0.01
+        return safe_softplus(nn.Dense(1)(x).squeeze()) * 0.01
 
 class DecDens(nn.Module):
-    """(z, coord_norm) → rho_local (scalar). Coordinate-conditioned.
-    softplus(0)*0.1 = 0.069 — between background (0) and anomaly (0.5)."""
+    """(z, coord_norm) → rho_local. safe_softplus prevents gradient death."""
     @nn.compact
     def __call__(self, z, coord):
         x=jnp.concatenate([z, coord])
         x=nn.relu(nn.Dense(128)(x))
         x=nn.relu(nn.Dense(64)(x))
         x=nn.relu(nn.Dense(32)(x))
-        return nn.softplus(nn.Dense(1)(x).squeeze()) * 0.1
+        return safe_softplus(nn.Dense(1)(x).squeeze()) * 0.1
 
 class DecILR(nn.Module):
     """(z, coord_norm, chi_local, rho_local) → ILR (3-dim)."""
@@ -196,28 +218,26 @@ vidx=jnp.array(df_va['cell_idx'].values,dtype=jnp.int32)
 # ============================================================
 # 4. LOSS + TRAIN
 # ============================================================
-def loss_fn(params, rng_key, lam_recon, lam_mag, lam_grav, lam_kl):
+def loss_fn(params, rng_key, lam_recon, lam_mag, lam_grav):
     mu,lv=enc.apply(params['enc'],mg_n,gg_n,hj,gj)
     z=mu  # deterministic
 
-    # Decode chi and rho for ALL cells (coordinate-conditioned)
     chi=vmap(lambda c:ds.apply(params['ds'],z,c))(all_coords_norm)
     rho=vmap(lambda c:dd.apply(params['dd'],z,c))(all_coords_norm)
 
-    # Forward models
     lm=jnp.mean((G_mag@chi-mo)**2)/jnp.var(mo)
     lg=jnp.mean((G_grav@rho-go)**2)/jnp.var(go)
 
-    # ILR at borehole locations
     ip=vmap(lambda c,ch,rh:di.apply(params['di'],z,c,ch,rh))(tcn,chi[tidx],rho[tidx])
     lr=jnp.mean((ip-tilr)**2)
 
-    # KL
-    lk=-0.5*jnp.mean(1+lv-mu**2-jnp.exp(lv))
+    # Soft upper bound penalty on rho — sum-based (not mean) to avoid dilution
+    loss_rho_bound = jnp.sum(jnp.maximum(rho - 0.25, 0.0)**2)
 
-    tot=lam_recon*lr+lam_mag*lm+lam_grav*lg+lam_kl*lk
-    return tot,{'total':tot,'recon':lr,'kl':lk,'mag':lm,'grav':lg,
-                'chi_max':jnp.max(chi),'rho_max':jnp.max(rho)}
+    tot=lam_recon*lr+lam_mag*lm+lam_grav*lg + 1.0*loss_rho_bound
+    return tot,{'total':tot,'recon':lr,'mag':lm,'grav':lg,
+                'chi_max':jnp.max(chi),'rho_max':jnp.max(rho),
+                'rho_bnd':loss_rho_bound}
 
 n_epochs=25000
 sched=optax.warmup_cosine_decay_schedule(init_value=1e-4,peak_value=2e-3,warmup_steps=500,decay_steps=n_epochs)
@@ -226,11 +246,11 @@ opt=optax.adam(sched); ost=opt.init(params)
 @jax.jit
 def step(params,ost,rng_key):
     (l,a),g=jax.value_and_grad(loss_fn,has_aux=True)(
-        params,rng_key,10.0,1.0,0.3,0.0)
+        params,rng_key,10.0,1.0,0.3)
     u,ost=opt.update(g,ost,params)
     return optax.apply_updates(params,u),ost,l,a
 
-print("\nTraining 25000 epochs (coord-conditioned, low grav)...")
+print("\nTraining 25000 epochs (safe_softplus chi + safe_sigmoid rho)...")
 t0=time.time()
 for ep in range(n_epochs):
     rng,sr=random.split(rng)
@@ -261,5 +281,6 @@ vp=np.array(vmap(lambda c,ch,rh:di.apply(params['di'],mu,c,ch,rh))(vcn,jnp.array
 print(f"Val ILR RMSE={float(np.sqrt(np.mean((vp-np.array(vilr))**2))):.4f}")
 
 print(f"\n--- Loss breakdown ---")
-for k in ['recon','mag','grav','kl']:
+for k in ['recon','mag','grav','rho_bnd']:
     print(f"  {k:10s}: {float(aux[k]):.6f}")
+print(f"  z_norm    : {float(jnp.linalg.norm(mu)):.2f}")

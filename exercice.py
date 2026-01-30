@@ -425,9 +425,24 @@ print(f"Forward gravity:   {float(grav_test.min()):.4f} – {float(grav_test.max
 # Two physical property decoders + one composition decoder.
 
 # %%
-# No explicit normalization constants needed — the coordinate-conditioned
-# decoders use softplus * scale directly, and chi/rho enter the ILR decoder
-# as chi*100 and rho*10 for numerical balance.
+# Custom activation functions with gradient floors to prevent "gradient death".
+# When the ILR reconstruction loss (lambda=10) dominates, it pushes softplus
+# pre-activations very negative. Standard softplus derivative (sigmoid) → 0
+# there, permanently killing the decoder. The custom VJP ensures a minimum
+# backward gradient of 0.01, keeping all decoders trainable throughout.
+
+@jax.custom_vjp
+def safe_softplus(x):
+    """Forward: standard softplus. Backward: gradient floor at 0.01."""
+    return jax.nn.softplus(x)
+
+def _sp_fwd(x):
+    return jax.nn.softplus(x), x
+
+def _sp_bwd(x, g):
+    return (g * jnp.maximum(jax.nn.sigmoid(x), 0.01),)
+
+safe_softplus.defvjp(_sp_fwd, _sp_bwd)
 
 # %%
 class MultiModalEncoder(nn.Module):
@@ -495,6 +510,7 @@ class DecoderSusceptibility(nn.Module):
     Coordinate-conditioned decoder (NeRF-style): each cell gets
     a position-dependent prediction from the shared latent vector.
     Weight sharing across all cells provides implicit spatial regularization.
+    safe_softplus prevents gradient death from ILR loss dominance.
     """
 
     @nn.compact
@@ -506,13 +522,14 @@ class DecoderSusceptibility(nn.Module):
         x = nn.relu(x)
         x = nn.Dense(32)(x)
         x = nn.relu(x)
-        return nn.softplus(nn.Dense(1)(x).squeeze()) * 0.01
+        return safe_softplus(nn.Dense(1)(x).squeeze()) * 0.01
 
 
 class DecoderDensity(nn.Module):
     """
     (latent, coord_norm) → Δρ_local (scalar).
     Same coordinate-conditioned architecture as susceptibility decoder.
+    safe_softplus prevents gradient death from ILR loss dominance.
     """
 
     @nn.compact
@@ -524,7 +541,7 @@ class DecoderDensity(nn.Module):
         x = nn.relu(x)
         x = nn.Dense(32)(x)
         x = nn.relu(x)
-        return nn.softplus(nn.Dense(1)(x).squeeze()) * 0.1
+        return safe_softplus(nn.Dense(1)(x).squeeze()) * 0.1
 
 
 class DecoderILR(nn.Module):
@@ -609,15 +626,23 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
     ilr_pred = vmap(predict_ilr)(train_coords_norm, chi_at_train, rho_at_train)
     loss_recon = jnp.mean((ilr_pred - train_ilr)**2)
 
+    # --- Rho bounding penalty ---
+    # safe_softplus gradient floor prevents rho from settling to zero,
+    # but can allow unbounded growth. Sum-based (not mean) penalty avoids
+    # dilution across 2048 cells when only a few explode.
+    loss_rho_bound = jnp.sum(jnp.maximum(rho_pred - 0.25, 0.0)**2)
+
     # --- Total ---
     loss_total = (lambda_recon * loss_recon
                   + lambda_mag * loss_mag
-                  + lambda_grav * loss_grav)
+                  + lambda_grav * loss_grav
+                  + 1.0 * loss_rho_bound)
 
     return loss_total, {
         'total': loss_total, 'recon': loss_recon,
         'mag': loss_mag, 'grav': loss_grav,
-        'chi_max': jnp.max(chi_pred), 'rho_max': jnp.max(rho_pred)
+        'chi_max': jnp.max(chi_pred), 'rho_max': jnp.max(rho_pred),
+        'rho_bnd': loss_rho_bound
     }
 
 # %% [markdown]
@@ -682,7 +707,7 @@ print("Data prepared for training")
 
 # %%
 # Optimizer with warmup cosine decay
-n_epochs = 12000
+n_epochs = 25000
 schedule = optax.warmup_cosine_decay_schedule(
     init_value=1e-4,
     peak_value=2e-3,
@@ -718,10 +743,10 @@ for epoch in range(n_epochs):
     params, opt_state, loss, aux = train_step(params, opt_state, step_rng)
     history.append({**{k: float(v) for k, v in aux.items()}, 'epoch': epoch})
 
-    if epoch % 1000 == 0:
-        print(f"Epoch {epoch:4d} | loss={aux['total']:.4f} | recon={aux['recon']:.4f} | "
+    if epoch % 2500 == 0:
+        print(f"Epoch {epoch:5d} | loss={aux['total']:.4f} | recon={aux['recon']:.4f} | "
               f"mag={aux['mag']:.4f} | grav={aux['grav']:.4f} | "
-              f"χ_max={aux['chi_max']:.4f} | ρ_max={aux['rho_max']:.4f}")
+              f"χ_max={aux['chi_max']:.5f} | ρ_max={aux['rho_max']:.5f}")
 
 # %%
 # Training curves
@@ -1024,7 +1049,7 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 # | KoBold                          | This Exercise                     |
 # |---------------------------------|-----------------------------------|
 # | TerraShed (data platform)       | Multi-branch encoder              |
-# | Machine Prospector (ML engine)  | VAE + multi-physics decoder       |
+# | Machine Prospector (ML engine)  | Deterministic encoder + decoders  |
 # | Full-physics joint inversion    | G_mag @ χ + G_grav @ Δρ losses    |
 # | Helicopter EM / SQUID           | (could add EM forward model)      |
 # | Hyperpod (spectral + LiDAR)     | Hyperspectral CNN branch          |
