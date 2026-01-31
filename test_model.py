@@ -157,32 +157,41 @@ class Encoder(nn.Module):
         return nn.Dense(self.latent_dim)(f), nn.Dense(self.latent_dim)(f)
 
 class DecSusc(nn.Module):
-    """(z, coord_norm) → chi_local. safe_softplus prevents gradient death."""
+    """(z, coord_norm) → chi_local. safe_softplus + MC Dropout."""
+    dropout_rate: float = 0.1
     @nn.compact
-    def __call__(self, z, coord):
+    def __call__(self, z, coord, deterministic=True):
         x=jnp.concatenate([z, coord])
         x=nn.relu(nn.Dense(128)(x))
+        x=nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
         x=nn.relu(nn.Dense(64)(x))
+        x=nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
         x=nn.relu(nn.Dense(32)(x))
         return safe_softplus(nn.Dense(1)(x).squeeze()) * 0.01
 
 class DecDens(nn.Module):
-    """(z, coord_norm) → rho_local. safe_softplus prevents gradient death."""
+    """(z, coord_norm) → rho_local. safe_softplus + MC Dropout."""
+    dropout_rate: float = 0.1
     @nn.compact
-    def __call__(self, z, coord):
+    def __call__(self, z, coord, deterministic=True):
         x=jnp.concatenate([z, coord])
         x=nn.relu(nn.Dense(128)(x))
+        x=nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
         x=nn.relu(nn.Dense(64)(x))
+        x=nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
         x=nn.relu(nn.Dense(32)(x))
         return safe_softplus(nn.Dense(1)(x).squeeze()) * 0.1
 
 class DecILR(nn.Module):
-    """(z, coord_norm, chi_local, rho_local) → ILR (3-dim)."""
+    """(z, coord_norm, chi_local, rho_local) → ILR (3-dim). MC Dropout."""
+    dropout_rate: float = 0.1
     @nn.compact
-    def __call__(self, z, coord, chi_l, rho_l):
+    def __call__(self, z, coord, chi_l, rho_l, deterministic=True):
         x=jnp.concatenate([z, coord, jnp.atleast_1d(chi_l*100), jnp.atleast_1d(rho_l*10)])
         x=nn.relu(nn.Dense(64)(x))
+        x=nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
         x=nn.relu(nn.Dense(32)(x))
+        x=nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
         return nn.Dense(3)(x)
 
 # ============================================================
@@ -223,13 +232,19 @@ def loss_fn(params, rng_key, lam_recon, lam_mag, lam_grav):
     mu,lv=enc.apply(params['enc'],mg_n,gg_n,hj,gj)
     z=mu  # deterministic
 
-    chi=vmap(lambda c:ds.apply(params['ds'],z,c))(all_coords_norm)
-    rho=vmap(lambda c:dd.apply(params['dd'],z,c))(all_coords_norm)
+    # Split RNG for MC Dropout in each decoder
+    rng_chi, rng_rho, rng_ilr = random.split(rng_key, 3)
+    keys_chi = random.split(rng_chi, all_coords_norm.shape[0])
+    keys_rho = random.split(rng_rho, all_coords_norm.shape[0])
+
+    chi=vmap(lambda c,k:ds.apply(params['ds'],z,c,deterministic=False,rngs={'dropout':k}))(all_coords_norm,keys_chi)
+    rho=vmap(lambda c,k:dd.apply(params['dd'],z,c,deterministic=False,rngs={'dropout':k}))(all_coords_norm,keys_rho)
 
     lm=jnp.mean((G_mag@chi-mo)**2)/jnp.var(mo)
     lg=jnp.mean((G_grav@rho-go)**2)/jnp.var(go)
 
-    ip=vmap(lambda c,ch,rh:di.apply(params['di'],z,c,ch,rh))(tcn,chi[tidx],rho[tidx])
+    keys_ilr = random.split(rng_ilr, tcn.shape[0])
+    ip=vmap(lambda c,ch,rh,k:di.apply(params['di'],z,c,ch,rh,deterministic=False,rngs={'dropout':k}))(tcn,chi[tidx],rho[tidx],keys_ilr)
     lr=jnp.mean(((ip-tilr)/tilr_std)**2)  # normalized per-dimension
 
     # Soft upper bound penalty on rho — sum-based (not mean) to avoid dilution
@@ -266,20 +281,33 @@ print(f"Done in {time.time()-t0:.0f}s")
 # 5. EVALUATE
 # ============================================================
 mu,_=enc.apply(params['enc'],mg_n,gg_n,hj,gj)
-chi_p=np.array(vmap(lambda c:ds.apply(params['ds'],mu,c))(all_coords_norm))
-rho_p=np.array(vmap(lambda c:dd.apply(params['dd'],mu,c))(all_coords_norm))
+chi_p=np.array(vmap(lambda c:ds.apply(params['ds'],mu,c,deterministic=True))(all_coords_norm))
+rho_p=np.array(vmap(lambda c:dd.apply(params['dd'],mu,c,deterministic=True))(all_coords_norm))
 
 def r2(t,p): return 1-np.sum((t-p)**2)/np.sum((t-t.mean())**2)
 print(f"\nchi R²={r2(susceptibility_true,chi_p):.4f}  range: {chi_p.min():.5f}-{chi_p.max():.5f} (true: {susceptibility_true.min():.5f}-{susceptibility_true.max():.5f})")
 print(f"rho R²={r2(density_true,rho_p):.4f}  range: {rho_p.min():.4f}-{rho_p.max():.4f} (true: {density_true.min():.4f}-{density_true.max():.4f})")
 
-ilr_all=np.array(vmap(lambda c,ch,rh:di.apply(params['di'],mu,c,ch,rh))(all_coords_norm,jnp.array(chi_p),jnp.array(rho_p)))
+ilr_all=np.array(vmap(lambda c,ch,rh:di.apply(params['di'],mu,c,ch,rh,deterministic=True))(all_coords_norm,jnp.array(chi_p),jnp.array(rho_p)))
 Cu_p=ilr_inverse(ilr_all)[:,0]
 print(f"Cu R²={r2(Cu,Cu_p):.4f}  corr={np.corrcoef(Cu,Cu_p)[0,1]:.4f}  range: {Cu_p.min()*100:.2f}%-{Cu_p.max()*100:.2f}% (true: {Cu.min()*100:.2f}%-{Cu.max()*100:.2f}%)")
 
 # Val
-vp=np.array(vmap(lambda c,ch,rh:di.apply(params['di'],mu,c,ch,rh))(vcn,jnp.array(chi_p)[vidx],jnp.array(rho_p)[vidx]))
+vp=np.array(vmap(lambda c,ch,rh:di.apply(params['di'],mu,c,ch,rh,deterministic=True))(vcn,jnp.array(chi_p)[vidx],jnp.array(rho_p)[vidx]))
 print(f"Val ILR RMSE={float(np.sqrt(np.mean((vp-np.array(vilr))**2))):.4f}")
+
+# MC Dropout uncertainty (10 draws for quick test)
+print("\n--- MC Dropout uncertainty (10 draws) ---")
+chi_mc,rho_mc=[],[]
+for i in range(10):
+    rng,rk=random.split(rng)
+    kc=random.split(random.fold_in(rk,0),all_coords_norm.shape[0])
+    kr=random.split(random.fold_in(rk,1),all_coords_norm.shape[0])
+    chi_mc.append(np.array(vmap(lambda c,k:ds.apply(params['ds'],mu,c,deterministic=False,rngs={'dropout':k}))(all_coords_norm,kc)))
+    rho_mc.append(np.array(vmap(lambda c,k:dd.apply(params['dd'],mu,c,deterministic=False,rngs={'dropout':k}))(all_coords_norm,kr)))
+chi_mc=np.stack(chi_mc); rho_mc=np.stack(rho_mc)
+print(f"  chi σ: {chi_mc.std(0).min():.6f}-{chi_mc.std(0).max():.6f}")
+print(f"  rho σ: {rho_mc.std(0).min():.5f}-{rho_mc.std(0).max():.5f}")
 
 print(f"\n--- Loss breakdown ---")
 for k in ['recon','mag','grav','rho_bnd']:

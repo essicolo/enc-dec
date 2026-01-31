@@ -56,8 +56,10 @@
 #    (avoids parasitic autoencoder shortcuts).
 # 2. Coordinate-conditioned decoders (NeRF-style): each cell gets (z, x, y, z)
 #    → chi/rho, with shared weights providing implicit spatial regularization.
-# 3. Deterministic encoder (no VAE sampling) — KL loss fights recon loss
-#    in single-scene problems.
+# 3. MC Dropout in decoders — principled Bayesian uncertainty via
+#    approximate variational inference (Gal & Ghahramani, 2016).
+#    Dropout stays active at inference; multiple forward passes sample
+#    the approximate posterior over weights.
 
 # %% [markdown]
 # ## Setup
@@ -511,15 +513,19 @@ class DecoderSusceptibility(nn.Module):
     a position-dependent prediction from the shared latent vector.
     Weight sharing across all cells provides implicit spatial regularization.
     safe_softplus prevents gradient death from ILR loss dominance.
+    MC Dropout provides Bayesian uncertainty (Gal & Ghahramani, 2016).
     """
+    dropout_rate: float = 0.1
 
     @nn.compact
-    def __call__(self, latent, coord_norm):
+    def __call__(self, latent, coord_norm, deterministic=True):
         x = jnp.concatenate([latent, coord_norm])
         x = nn.Dense(128)(x)
         x = nn.relu(x)
+        x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
         x = nn.Dense(64)(x)
         x = nn.relu(x)
+        x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
         x = nn.Dense(32)(x)
         x = nn.relu(x)
         return safe_softplus(nn.Dense(1)(x).squeeze()) * 0.01
@@ -530,15 +536,19 @@ class DecoderDensity(nn.Module):
     (latent, coord_norm) → Δρ_local (scalar).
     Same coordinate-conditioned architecture as susceptibility decoder.
     safe_softplus prevents gradient death from ILR loss dominance.
+    MC Dropout provides Bayesian uncertainty (Gal & Ghahramani, 2016).
     """
+    dropout_rate: float = 0.1
 
     @nn.compact
-    def __call__(self, latent, coord_norm):
+    def __call__(self, latent, coord_norm, deterministic=True):
         x = jnp.concatenate([latent, coord_norm])
         x = nn.Dense(128)(x)
         x = nn.relu(x)
+        x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
         x = nn.Dense(64)(x)
         x = nn.relu(x)
+        x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
         x = nn.Dense(32)(x)
         x = nn.relu(x)
         return safe_softplus(nn.Dense(1)(x).squeeze()) * 0.1
@@ -549,17 +559,21 @@ class DecoderILR(nn.Module):
     Latent + local physical properties + coordinates → ILR compositions.
     Both chi_local and rho_local provide direct physical bridges from
     the geophysical inversion to compositional prediction.
+    MC Dropout provides Bayesian uncertainty (Gal & Ghahramani, 2016).
     """
+    dropout_rate: float = 0.1
 
     @nn.compact
-    def __call__(self, latent, coord_norm, chi_local, rho_local):
+    def __call__(self, latent, coord_norm, chi_local, rho_local, deterministic=True):
         x = jnp.concatenate([latent, coord_norm,
                              jnp.atleast_1d(chi_local * 100),
                              jnp.atleast_1d(rho_local * 10)])
         x = nn.Dense(64)(x)
         x = nn.relu(x)
+        x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
         x = nn.Dense(32)(x)
         x = nn.relu(x)
+        x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
         return nn.Dense(3)(x)
 
 
@@ -598,6 +612,7 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
     Surface data (hyperspectral, geochemistry) are encoder inputs only —
     NO decoder losses on them (avoids parasitic autoencoder shortcuts).
     Deterministic encoder (no VAE sampling / KL) — avoids KL fighting recon.
+    MC Dropout active during training (deterministic=False) for Bayesian UQ.
     """
 
     # --- Encode (all 4 surface sensors) → deterministic latent ---
@@ -605,9 +620,18 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
                                 mag_grid, grav_grid, hyper_img, geochem_grid)
     z = mu  # deterministic — no sampling, no KL
 
-    # --- Decode physical properties at ALL cell locations ---
-    chi_pred = vmap(lambda c: dec_susc.apply(params['dec_susc'], z, c))(all_coords_norm)
-    rho_pred = vmap(lambda c: dec_dens.apply(params['dec_dens'], z, c))(all_coords_norm)
+    # --- Split RNG for MC Dropout in each decoder ---
+    rng_chi, rng_rho, rng_ilr = random.split(rng_key, 3)
+    keys_chi = random.split(rng_chi, all_coords_norm.shape[0])
+    keys_rho = random.split(rng_rho, all_coords_norm.shape[0])
+
+    # --- Decode physical properties at ALL cell locations (dropout active) ---
+    chi_pred = vmap(lambda c, k: dec_susc.apply(
+        params['dec_susc'], z, c, deterministic=False,
+        rngs={'dropout': k}))(all_coords_norm, keys_chi)
+    rho_pred = vmap(lambda c, k: dec_dens.apply(
+        params['dec_dens'], z, c, deterministic=False,
+        rngs={'dropout': k}))(all_coords_norm, keys_rho)
 
     # --- Forward models (PINN) — geophysical consistency ---
     mag_pred = forward_magnetic_jax(chi_pred)
@@ -616,14 +640,16 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
     loss_mag = jnp.mean((mag_pred - mag_observed)**2) / jnp.var(mag_observed)
     loss_grav = jnp.mean((grav_pred - grav_observed)**2) / jnp.var(grav_observed)
 
-    # --- Decode ILR at drill hole locations ---
+    # --- Decode ILR at drill hole locations (dropout active) ---
     chi_at_train = chi_pred[train_cell_idx]
     rho_at_train = rho_pred[train_cell_idx]
+    keys_ilr = random.split(rng_ilr, train_coords_norm.shape[0])
 
-    def predict_ilr(coord, chi_local, rho_local):
-        return dec_ilr.apply(params['dec_ilr'], z, coord, chi_local, rho_local)
+    def predict_ilr(coord, chi_local, rho_local, k):
+        return dec_ilr.apply(params['dec_ilr'], z, coord, chi_local, rho_local,
+                             deterministic=False, rngs={'dropout': k})
 
-    ilr_pred = vmap(predict_ilr)(train_coords_norm, chi_at_train, rho_at_train)
+    ilr_pred = vmap(predict_ilr)(train_coords_norm, chi_at_train, rho_at_train, keys_ilr)
     loss_recon = jnp.mean(((ilr_pred - train_ilr) / train_ilr_std)**2)
 
     # --- Rho bounding penalty ---
@@ -772,9 +798,9 @@ mu, log_var = encoder.apply(params['encoder'],
                             mag_grid_norm, grav_grid_norm,
                             hyper_img_jax, geochem_grid_jax)
 
-# Decode physical properties at all cell locations
-chi_pred = vmap(lambda c: dec_susc.apply(params['dec_susc'], mu, c))(all_coords_norm)
-rho_pred = vmap(lambda c: dec_dens.apply(params['dec_dens'], mu, c))(all_coords_norm)
+# Decode physical properties at all cell locations (dropout off = deterministic mean)
+chi_pred = vmap(lambda c: dec_susc.apply(params['dec_susc'], mu, c, deterministic=True))(all_coords_norm)
+rho_pred = vmap(lambda c: dec_dens.apply(params['dec_dens'], mu, c, deterministic=True))(all_coords_norm)
 chi_pred_np = np.array(chi_pred)
 rho_pred_np = np.array(rho_pred)
 
@@ -793,35 +819,57 @@ print(f"Grav predicted: {float(grav_from_pred.min()):.4f} – {float(grav_from_p
 print(f"Grav observed:  {grav_observed.min():.4f} – {grav_observed.max():.4f} mGal")
 
 # %% [markdown]
-# ## Predict compositions with uncertainty (latent perturbation)
+# ## Predict compositions with MC Dropout uncertainty
+#
+# MC Dropout (Gal & Ghahramani, 2016): keep dropout active during inference.
+# Each forward pass randomly drops different neurons, effectively sampling
+# from an approximate posterior over network weights. The variance across
+# samples gives calibrated epistemic uncertainty — regions where the
+# network is unsure will show high variance because different weight
+# configurations produce different predictions.
 
 # %%
-# Since we use deterministic encoding, we estimate uncertainty
-# by perturbing the latent vector with small noise.
-n_samples = 100
+n_mc_samples = 50
+chi_samples = []
+rho_samples = []
 ilr_samples = []
-perturbation_scale = 0.1
 
-for i in range(n_samples):
-    rng, sample_rng = random.split(rng)
-    eps = random.normal(sample_rng, mu.shape)
-    z = mu + perturbation_scale * eps
+for i in range(n_mc_samples):
+    rng, rng_chi, rng_rho, rng_ilr = random.split(rng, 4)
+    keys_chi = random.split(rng_chi, all_coords_norm.shape[0])
+    keys_rho = random.split(rng_rho, all_coords_norm.shape[0])
 
-    chi_sample = vmap(lambda c: dec_susc.apply(params['dec_susc'], z, c))(all_coords_norm)
-    rho_sample = vmap(lambda c: dec_dens.apply(params['dec_dens'], z, c))(all_coords_norm)
+    # Decode with dropout ON (deterministic=False) — each pass samples different weights
+    chi_s = vmap(lambda c, k: dec_susc.apply(
+        params['dec_susc'], mu, c, deterministic=False,
+        rngs={'dropout': k}))(all_coords_norm, keys_chi)
+    rho_s = vmap(lambda c, k: dec_dens.apply(
+        params['dec_dens'], mu, c, deterministic=False,
+        rngs={'dropout': k}))(all_coords_norm, keys_rho)
 
-    def predict_ilr(coord, chi_local, rho_local):
-        return dec_ilr.apply(params['dec_ilr'], z, coord, chi_local, rho_local)
+    keys_ilr = random.split(rng_ilr, all_coords_norm.shape[0])
+    ilr_s = vmap(lambda c, ch, rh, k: dec_ilr.apply(
+        params['dec_ilr'], mu, c, ch, rh, deterministic=False,
+        rngs={'dropout': k}))(all_coords_norm, chi_s, rho_s, keys_ilr)
 
-    ilr_sample = vmap(predict_ilr)(all_coords_norm, chi_sample, rho_sample)
-    ilr_samples.append(np.array(ilr_sample))
+    chi_samples.append(np.array(chi_s))
+    rho_samples.append(np.array(rho_s))
+    ilr_samples.append(np.array(ilr_s))
 
+chi_samples = np.stack(chi_samples)
+rho_samples = np.stack(rho_samples)
 ilr_samples = np.stack(ilr_samples)
+
+# MC Dropout statistics
 ilr_mean = ilr_samples.mean(axis=0)
 ilr_std = ilr_samples.std(axis=0)
+chi_mc_std = chi_samples.std(axis=0)
+rho_mc_std = rho_samples.std(axis=0)
 
-print(f"ILR predicted: {ilr_mean.min():.2f} – {ilr_mean.max():.2f}")
-print(f"Uncertainty:   {ilr_std.min():.3f} – {ilr_std.max():.3f}")
+print(f"ILR predicted:  {ilr_mean.min():.2f} – {ilr_mean.max():.2f}")
+print(f"ILR uncertainty: {ilr_std.min():.3f} – {ilr_std.max():.3f}")
+print(f"χ uncertainty:   {chi_mc_std.min():.6f} – {chi_mc_std.max():.6f}")
+print(f"Δρ uncertainty:  {rho_mc_std.min():.5f} – {rho_mc_std.max():.5f}")
 
 # %%
 comp_pred = ilr_inverse(ilr_mean)
@@ -838,7 +886,8 @@ def predict_ilr_at_coords(mu_latent, coords_norm, cell_idx):
     chi_at = chi_pred[cell_idx]
     rho_at = rho_pred[cell_idx]
     def predict(coord, chi_l, rho_l):
-        return dec_ilr.apply(params['dec_ilr'], mu_latent, coord, chi_l, rho_l)
+        return dec_ilr.apply(params['dec_ilr'], mu_latent, coord, chi_l, rho_l,
+                             deterministic=True)
     return vmap(predict)(coords_norm, chi_at, rho_at)
 
 # Training metrics
@@ -891,7 +940,9 @@ df_results = pd.DataFrame({
     'rho_true': density_true[idx_slice],
     'Cu_pred': Cu_pred[idx_slice] * 100,
     'Cu_true': Cu[idx_slice] * 100,
-    'uncertainty': ilr_std[idx_slice, 0]
+    'uncertainty_ilr': ilr_std[idx_slice, 0],
+    'uncertainty_chi': chi_mc_std[idx_slice],
+    'uncertainty_rho': rho_mc_std[idx_slice],
 })
 
 df_holes_train = df_train.drop_duplicates('hole')[['x', 'y']]
@@ -960,11 +1011,31 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 # %%
 (
     lp.ggplot(df_results)
-    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='uncertainty'))
+    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='uncertainty_ilr'))
     + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
     + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
     + lp.scale_fill_gradient(low='white', high='purple', name='σ')
-    + lp.labs(title=f'Uncertainty on ILR[0] (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
+    + lp.labs(title=f'MC Dropout uncertainty — ILR[0] (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
+)
+
+# %%
+(
+    lp.ggplot(df_results)
+    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='uncertainty_chi'))
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
+    + lp.scale_fill_gradient(low='white', high='darkblue', name='σ_χ')
+    + lp.labs(title=f'MC Dropout uncertainty — susceptibility (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
+)
+
+# %%
+(
+    lp.ggplot(df_results)
+    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='uncertainty_rho'))
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
+    + lp.scale_fill_gradient(low='white', high='#2d1b69', name='σ_ρ')
+    + lp.labs(title=f'MC Dropout uncertainty — density (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
 
 # %% [markdown]
@@ -1113,9 +1184,12 @@ fig.show()
 #    anomaly patterns. This approach resolves the non-uniqueness of
 #    geophysical inversion by integrating spatial structure.
 #
-# 5. **Uncertainty quantification**: Latent perturbation sampling
-#    propagates uncertainty through all decoders, providing
-#    spatially-varying confidence estimates for exploration targeting.
+# 5. **MC Dropout uncertainty** (Gal & Ghahramani, 2016): Dropout
+#    stays active during inference, and multiple forward passes
+#    sample from an approximate posterior over network weights.
+#    This provides calibrated, spatially-varying epistemic
+#    uncertainty for exploration targeting — no arbitrary
+#    perturbation scale required.
 #
 # ### Comparison to KoBold Metals' Approach
 #
@@ -1127,10 +1201,12 @@ fig.show()
 # | Helicopter EM / SQUID           | (could add EM forward model)      |
 # | Hyperpod (spectral + LiDAR)     | Hyperspectral CNN branch          |
 # | Geochemical analysis            | Soil geochem + drill hole assays  |
-# | Uncertainty quantification      | Posterior sampling (100 draws)    |
+# | Uncertainty quantification      | MC Dropout (50 draws)             |
 #
 # ### References
 #
 # - KoBold Metals. AI-powered mineral exploration.
 #   IEEE Spectrum (2024): https://spectrum.ieee.org/ai-mining
+# - Gal, Y. & Ghahramani, Z. (2016). Dropout as a Bayesian Approximation:
+#   Representing Model Uncertainty in Deep Learning. ICML.
 # - Eagar, K. (SimPEG). Open-source geophysical modeling.
