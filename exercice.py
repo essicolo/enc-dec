@@ -586,7 +586,7 @@ class DecoderILR(nn.Module):
 def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
             mag_grid, grav_grid, hyper_img, geochem_grid,
             mag_observed, grav_observed,
-            all_coords_norm, train_coords_norm, train_ilr, train_cell_idx,
+            all_coords_norm, train_coords_norm, train_ilr, train_ilr_std, train_cell_idx,
             rng_key,
             lambda_recon=10.0, lambda_mag=1.0, lambda_grav=0.3):
     """
@@ -724,7 +724,7 @@ def train_step(params, opt_state, rng_key):
         params, encoder, dec_susc, dec_dens, dec_ilr,
         mag_grid_norm, grav_grid_norm, hyper_img_jax, geochem_grid_jax,
         mag_obs_jax, grav_obs_jax,
-        all_coords_norm, train_coords_norm, train_ilr, train_cell_idx,
+        all_coords_norm, train_coords_norm, train_ilr, train_ilr_std, train_cell_idx,
         rng_key,
         lambda_recon=10.0,
         lambda_mag=1.0,
@@ -993,6 +993,78 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
     + lp.geom_abline(slope=1, intercept=0, color='red', linetype='dashed')
     + lp.labs(title='Cu: predicted vs true', x='Cu true (%)', y='Cu predicted (%)')
 )
+
+# %% [markdown]
+# ## Interactive 3D View
+#
+# Volumetric Cu predictions with drill hole locations.
+# Cells below a threshold are made transparent to reveal the anomaly structure.
+
+# %%
+import plotly.graph_objects as go
+
+# Build 3D volume data — show cells above a Cu threshold
+cu_threshold = 0.6  # % — show only cells with predicted Cu above this
+cu_all = Cu_pred * 100  # predicted Cu for all cells
+cu_true_all = Cu * 100
+
+# Predicted Cu — 3D scatter of enriched cells
+mask_pred = cu_all > cu_threshold
+fig = go.Figure()
+
+fig.add_trace(go.Scatter3d(
+    x=cc[mask_pred, 0], y=cc[mask_pred, 1], z=cc[mask_pred, 2],
+    mode='markers',
+    marker=dict(
+        size=5,
+        color=cu_all[mask_pred],
+        colorscale='Reds',
+        cmin=cu_threshold, cmax=cu_all.max(),
+        opacity=0.6,
+        colorbar=dict(title='Cu %', x=1.0)
+    ),
+    name='Predicted Cu',
+    hovertemplate='X=%{x:.0f}m<br>Y=%{y:.0f}m<br>Z=%{z:.0f}m<br>Cu=%{marker.color:.2f}%'
+))
+
+# True Cu — wireframe outline of enriched zone
+mask_true = cu_true_all > cu_threshold
+fig.add_trace(go.Scatter3d(
+    x=cc[mask_true, 0], y=cc[mask_true, 1], z=cc[mask_true, 2],
+    mode='markers',
+    marker=dict(size=3, color='blue', opacity=0.15, symbol='square'),
+    name='True Cu > threshold',
+    hovertemplate='X=%{x:.0f}m<br>Y=%{y:.0f}m<br>Z=%{z:.0f}m<br>Cu=%{text:.2f}%',
+    text=cu_true_all[mask_true]
+))
+
+# Drill holes
+for label, df_h, color in [('Train holes', df_holes_train, 'black'), ('Val holes', df_holes_val, 'red')]:
+    df_full = df_forages[df_forages['hole'].isin(df_h.index if 'hole' not in df_h.columns else
+              df_forages[~df_forages['is_validation']]['hole'].unique() if color == 'black' else
+              df_forages[df_forages['is_validation']]['hole'].unique())]
+    for hole_name in df_full['hole'].unique():
+        dh = df_full[df_full['hole'] == hole_name].sort_values('z', ascending=False)
+        fig.add_trace(go.Scatter3d(
+            x=dh['x'], y=dh['y'], z=dh['z'],
+            mode='lines+markers',
+            marker=dict(size=2, color=color),
+            line=dict(color=color, width=3),
+            name=hole_name,
+            showlegend=False,
+            hovertemplate=f'{hole_name}<br>Z=%{{z:.0f}}m'
+        ))
+
+fig.update_layout(
+    title='3D Cu Prediction — Predicted (red) vs True enrichment zone (blue)',
+    scene=dict(
+        xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='Z (m)',
+        aspectmode='data'
+    ),
+    width=900, height=700,
+    legend=dict(x=0, y=1)
+)
+fig.show()
 
 # %% [markdown]
 # ---
