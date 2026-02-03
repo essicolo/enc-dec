@@ -1,0 +1,290 @@
+<mxfile host="app.diagrams.net" modified="2026-02-02" agent="Claude" version="24.0.0" type="device">
+  <diagram name="GemPy + NeRF Architecture" id="architecture">
+    <mxGraphModel dx="1422" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- ==================== TITLE ==================== -->
+        <mxCell id="title" value="&lt;b&gt;GemPy + NeRF Encoder-Decoder PINN&lt;/b&gt;&lt;br&gt;Multi-Sensor Geophysical-Geochemical Joint Inversion" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="440" y="10" width="460" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== INPUT DATA (Top) ==================== -->
+        <mxCell id="input_label" value="&lt;b&gt;Input Data&lt;/b&gt;" style="text;html=1;align=center;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="70" width="100" height="20" as="geometry"/>
+        </mxCell>
+
+        <!-- Magnetics -->
+        <mxCell id="mag_input" value="&lt;b&gt;Airborne Magnetics&lt;/b&gt;&lt;br&gt;20×20 grid, z=80m&lt;br&gt;TMI (nT)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="100" width="150" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Gravity -->
+        <mxCell id="grav_input" value="&lt;b&gt;Ground Gravity&lt;/b&gt;&lt;br&gt;20×20 grid, z=1m&lt;br&gt;gz (mGal)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="210" y="100" width="150" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Hyperspectral -->
+        <mxCell id="hyper_input" value="&lt;b&gt;Hyperspectral&lt;/b&gt;&lt;br&gt;16×16×10 bands&lt;br&gt;VNIR–SWIR reflectance" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="380" y="100" width="150" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Geochemistry -->
+        <mxCell id="geochem_input" value="&lt;b&gt;Soil Geochemistry&lt;/b&gt;&lt;br&gt;16×16×5 elements&lt;br&gt;Cu, Ni, Co, Fe, S" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="550" y="100" width="150" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== CNN BRANCHES ==================== -->
+        <mxCell id="mag_cnn" value="CNN Branch 1&lt;br&gt;&lt;font size=&quot;1&quot;&gt;Conv16→Conv32→FC64&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="55" y="200" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="grav_cnn" value="CNN Branch 2&lt;br&gt;&lt;font size=&quot;1&quot;&gt;Conv16→Conv32→FC64&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="225" y="200" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="hyper_cnn" value="CNN Branch 3&lt;br&gt;&lt;font size=&quot;1&quot;&gt;Conv16→Conv32→FC64&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="395" y="200" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="geochem_cnn" value="CNN Branch 4&lt;br&gt;&lt;font size=&quot;1&quot;&gt;Conv16→FC32&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="565" y="200" width="120" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrows: inputs → CNN branches -->
+        <mxCell id="e1" edge="1" source="mag_input" target="mag_cnn" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e2" edge="1" source="grav_input" target="grav_cnn" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e3" edge="1" source="hyper_input" target="hyper_cnn" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e4" edge="1" source="geochem_input" target="geochem_cnn" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- ==================== FUSION MLP ==================== -->
+        <mxCell id="fusion" value="&lt;b&gt;Fusion MLP&lt;/b&gt;&lt;br&gt;concat(64+64+64+32=224)&lt;br&gt;→ FC128 → GeLU → FC64 → GeLU" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="230" y="280" width="280" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrows: CNN branches → Fusion -->
+        <mxCell id="e5" edge="1" source="mag_cnn" target="fusion" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e6" edge="1" source="grav_cnn" target="fusion" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e7" edge="1" source="hyper_cnn" target="fusion" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e8" edge="1" source="geochem_cnn" target="fusion" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- ==================== LATENT z ==================== -->
+        <mxCell id="latent" value="&lt;b&gt;Latent z&lt;/b&gt; (32-dim)&lt;br&gt;μ = FC(64→32)&lt;br&gt;&lt;i&gt;deterministic: z = μ&lt;/i&gt;" style="ellipse;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="365" width="150" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="e9" edge="1" source="fusion" target="latent" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- ==================== GemPy (Right side) ==================== -->
+        <mxCell id="gempy_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;strokeWidth=2;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="800" y="80" width="320" height="260" as="geometry"/>
+        </mxCell>
+        <mxCell id="gempy_title" value="&lt;b&gt;GemPy Structural Model&lt;/b&gt;&lt;br&gt;&lt;i&gt;Geological prior knowledge&lt;/i&gt;" style="text;html=1;align=center;fontSize=12;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="840" y="85" width="240" height="40" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="contacts" value="&lt;b&gt;Contact Points&lt;/b&gt;&lt;br&gt;(x,y,z) where lithology&lt;br&gt;changes in drill core" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="820" y="130" width="130" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="orientations" value="&lt;b&gt;Orientations&lt;/b&gt;&lt;br&gt;Dip/strike of layers&lt;br&gt;(pole vectors)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="970" y="130" width="130" height="55" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="gempy_interp" value="&lt;b&gt;Implicit Surface Interpolation&lt;/b&gt;&lt;br&gt;Universal co-kriging&lt;br&gt;→ scalar potential field φ(x,y,z)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;fontStyle=0;" vertex="1" parent="1">
+          <mxGeometry x="840" y="210" width="230" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_c" edge="1" source="contacts" target="gempy_interp" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_o" edge="1" source="orientations" target="gempy_interp" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <mxCell id="gempy_outputs" value="&lt;b&gt;φ(x,y,z)&lt;/b&gt; — scalar field&lt;br&gt;&lt;b&gt;unit_id&lt;/b&gt; — lithology class" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;fontStyle=0;" vertex="1" parent="1">
+          <mxGeometry x="870" y="285" width="170" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_gi" edge="1" source="gempy_interp" target="gempy_outputs" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Borehole litho logs -->
+        <mxCell id="litho_logs" value="&lt;b&gt;Borehole Lithological Logs&lt;/b&gt;&lt;br&gt;fresh_gneiss → altered →&lt;br&gt;disseminated → massive sulfide" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="130" width="180" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_litho" edge="1" source="litho_logs" target="contacts" parent="1" style="dashed=1;strokeColor=#82b366;"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Unit embedding -->
+        <mxCell id="unit_embed" value="&lt;b&gt;Unit Embedding&lt;/b&gt;&lt;br&gt;nn.Embedding(4, 4)&lt;br&gt;learned per rock type" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="280" width="150" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_uid" edge="1" source="litho_logs" target="unit_embed" parent="1" style="strokeColor=#82b366;"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- ==================== COORDINATE INPUT ==================== -->
+        <mxCell id="coord_input" value="&lt;b&gt;Cell coordinates&lt;/b&gt;&lt;br&gt;(x, y, z) normalized&lt;br&gt;for each of 2048 cells" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#999999;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="440" width="140" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== DECODERS (center-bottom) ==================== -->
+        <!-- Background box for decoders -->
+        <mxCell id="dec_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF8F0;strokeColor=#D4A76A;strokeWidth=2;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="220" y="460" width="900" height="180" as="geometry"/>
+        </mxCell>
+        <mxCell id="dec_label" value="&lt;b&gt;NeRF-Style Decoders&lt;/b&gt; — shared weights across all 2048 cells (implicit spatial regularization)" style="text;html=1;align=center;fontSize=11;fontColor=#8B6914;" vertex="1" parent="1">
+          <mxGeometry x="350" y="465" width="560" height="20" as="geometry"/>
+        </mxCell>
+
+        <!-- Input concatenation -->
+        <mxCell id="dec_input" value="&lt;b&gt;Input per cell:&lt;/b&gt;&lt;br&gt;[z(32) + coord(3) + φ(1) + unit_emb(4)]" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="240" y="490" width="240" height="35" as="geometry"/>
+        </mxCell>
+
+        <!-- Decoder chi -->
+        <mxCell id="dec_chi" value="&lt;b&gt;Decoder χ&lt;/b&gt;&lt;br&gt;FC128→&lt;font color=&quot;#CC0000&quot;&gt;Drop&lt;/font&gt;→FC64→&lt;font color=&quot;#CC0000&quot;&gt;Drop&lt;/font&gt;→FC32&lt;br&gt;→ softplus × 0.01" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6D0FF;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="240" y="545" width="180" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Decoder rho -->
+        <mxCell id="dec_rho" value="&lt;b&gt;Decoder Δρ&lt;/b&gt;&lt;br&gt;FC128→&lt;font color=&quot;#CC0000&quot;&gt;Drop&lt;/font&gt;→FC64→&lt;font color=&quot;#CC0000&quot;&gt;Drop&lt;/font&gt;→FC32&lt;br&gt;→ softplus × 0.1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6D0FF;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="450" y="545" width="180" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Decoder ILR -->
+        <mxCell id="dec_ilr" value="&lt;b&gt;Decoder ILR&lt;/b&gt;&lt;br&gt;[...+ χ×100 + ρ×10]&lt;br&gt;FC64→&lt;font color=&quot;#CC0000&quot;&gt;Drop&lt;/font&gt;→FC32→&lt;font color=&quot;#CC0000&quot;&gt;Drop&lt;/font&gt;→FC3" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6D0FF;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="770" y="545" width="180" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- MC Dropout label -->
+        <mxCell id="dropout_label" value="&lt;font color=&quot;#CC0000&quot;&gt;&lt;b&gt;Drop&lt;/b&gt; = MC Dropout (10%)&lt;br&gt;Active during inference → Bayesian UQ&lt;/font&gt;" style="text;html=1;align=center;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="240" y="600" width="200" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrows: inputs → decoders -->
+        <mxCell id="e10" edge="1" source="dec_input" target="dec_chi" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e11" edge="1" source="dec_input" target="dec_rho" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_latent_dec" edge="1" source="latent" target="dec_input" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_coord_dec" edge="1" source="coord_input" target="dec_input" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_gempy_dec" edge="1" source="gempy_outputs" target="dec_input" parent="1" style="strokeColor=#82b366;strokeWidth=2;"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_embed_dec" edge="1" source="unit_embed" target="dec_input" parent="1" style="strokeColor=#82b366;strokeWidth=2;"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Chi/rho → ILR decoder (physical bridge) -->
+        <mxCell id="e_chi_ilr" edge="1" source="dec_chi" target="dec_ilr" parent="1" style="strokeColor=#9673a6;strokeWidth=2;dashed=1;">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="660" y="590"/></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_rho_ilr" edge="1" source="dec_rho" target="dec_ilr" parent="1" style="strokeColor=#9673a6;strokeWidth=2;dashed=1;">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="700" y="580"/></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="bridge_label" value="&lt;i&gt;physical bridge:&lt;br&gt;χ and ρ inform&lt;br&gt;compositions&lt;/i&gt;" style="text;html=1;align=center;fontSize=9;fontColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="650" y="545" width="100" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- ==================== OUTPUTS / LOSSES (Bottom) ==================== -->
+        <!-- Chi output -->
+        <mxCell id="chi_out" value="&lt;b&gt;χ field&lt;/b&gt;&lt;br&gt;(2048 cells)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="200" y="680" width="100" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_dchi" edge="1" source="dec_chi" target="chi_out" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Rho output -->
+        <mxCell id="rho_out" value="&lt;b&gt;Δρ field&lt;/b&gt;&lt;br&gt;(2048 cells)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="430" y="680" width="100" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_drho" edge="1" source="dec_rho" target="rho_out" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- ILR output -->
+        <mxCell id="ilr_out" value="&lt;b&gt;ILR&lt;/b&gt; (3-dim)&lt;br&gt;→ Cu, Ni, Co %" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="810" y="680" width="110" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_dilr" edge="1" source="dec_ilr" target="ilr_out" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Forward physics -->
+        <mxCell id="fwd_mag" value="&lt;b&gt;G_mag @ χ&lt;/b&gt;&lt;br&gt;SimPEG forward" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#CC0000;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="130" y="760" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="fwd_grav" value="&lt;b&gt;G_grav @ Δρ&lt;/b&gt;&lt;br&gt;SimPEG forward" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#CC0000;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="380" y="760" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_fwdm" edge="1" source="chi_out" target="fwd_mag" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_fwdg" edge="1" source="rho_out" target="fwd_grav" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Losses -->
+        <mxCell id="loss_mag" value="&lt;b&gt;L_mag&lt;/b&gt;&lt;br&gt;‖pred − obs‖² / σ²" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#CC0000;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="120" y="840" width="140" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="loss_grav" value="&lt;b&gt;L_grav&lt;/b&gt;&lt;br&gt;‖pred − obs‖² / σ²" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#CC0000;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="370" y="840" width="140" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="loss_recon" value="&lt;b&gt;L_recon&lt;/b&gt;&lt;br&gt;‖(ILR_pred−ILR_obs)/σ_dim‖²&lt;br&gt;at 64 borehole locations" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#CC0000;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="700" y="840" width="220" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="loss_rho_bnd" value="&lt;b&gt;L_ρ_bound&lt;/b&gt;&lt;br&gt;Σ max(ρ−0.25, 0)²" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#CC0000;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="530" y="840" width="140" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e_lm" edge="1" source="fwd_mag" target="loss_mag" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_lg" edge="1" source="fwd_grav" target="loss_grav" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_lr" edge="1" source="ilr_out" target="loss_recon" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_lb" edge="1" source="rho_out" target="loss_rho_bnd" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Observed data boxes -->
+        <mxCell id="obs_mag" value="Mag observed" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#999;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="40" y="850" width="80" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="obs_grav" value="Grav observed" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#999;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="290" y="850" width="80" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="obs_ilr" value="Borehole ILR" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#999;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="930" y="860" width="80" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_om" edge="1" source="obs_mag" target="loss_mag" parent="1" style="dashed=1;"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_og" edge="1" source="obs_grav" target="loss_grav" parent="1" style="dashed=1;"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_oi" edge="1" source="obs_ilr" target="loss_recon" parent="1" style="dashed=1;"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Total loss -->
+        <mxCell id="total_loss" value="&lt;b&gt;L_total = 10·L_recon + 1·L_mag + 0.3·L_grav + L_ρ_bound&lt;/b&gt;&lt;br&gt;&lt;br&gt;Gradients flow back through forward physics → decoders → encoder&lt;br&gt;(PyTorch autograd / end-to-end differentiable)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#CC0000;fontColor=#ffffff;strokeColor=#990000;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="260" y="940" width="530" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_tl1" edge="1" source="loss_mag" target="total_loss" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_tl2" edge="1" source="loss_grav" target="total_loss" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_tl3" edge="1" source="loss_recon" target="total_loss" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_tl4" edge="1" source="loss_rho_bnd" target="total_loss" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- ==================== LEGEND ==================== -->
+        <mxCell id="legend_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAFAFA;strokeColor=#CCCCCC;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="460" width="200" height="180" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_title" value="&lt;b&gt;Legend&lt;/b&gt;" style="text;html=1;align=center;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="465" width="80" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg1" value="" style="rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1175" y="490" width="20" height="15" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg1t" value="Input data (surface sensors)" style="text;html=1;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="488" width="150" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg2" value="" style="rounded=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="1175" y="512" width="20" height="15" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg2t" value="GemPy geological model" style="text;html=1;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="510" width="150" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg3" value="" style="rounded=1;fillColor=#E6D0FF;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="1175" y="534" width="20" height="15" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg3t" value="Neural network modules" style="text;html=1;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="532" width="150" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg4" value="" style="rhombus;fillColor=#FFE6E6;strokeColor=#CC0000;" vertex="1" parent="1">
+          <mxGeometry x="1172" y="556" width="25" height="18" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg4t" value="Loss functions" style="text;html=1;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="555" width="150" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg5" value="&lt;font color=&quot;#CC0000&quot;&gt;Drop&lt;/font&gt;" style="text;html=1;fontSize=9;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1175" y="578" width="30" height="15" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg5t" value="MC Dropout (Bayesian UQ)" style="text;html=1;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="577" width="150" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg6t" value="&lt;i&gt;No losses on surface data&lt;br&gt;(avoids parasitic shortcuts)&lt;/i&gt;" style="text;html=1;fontSize=9;fontColor=#999;" vertex="1" parent="1">
+          <mxGeometry x="1175" y="600" width="170" height="30" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
