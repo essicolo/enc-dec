@@ -1,65 +1,60 @@
 # %% [markdown]
-# # Multi-Sensor Geophysical Inversion with Encoder-Decoder PINN
+# # Multi-Sensor Geophysical Inversion with GemPy + NeRF Decoders
 #
-# ## Exploration Scenario
+# ## Architecture: Geological Structure meets Data-Driven Inversion
 #
-# A Cu-Ni-Co sulfide exploration program over a 4km × 4km area.
-# Multiple data sources are integrated through a shared latent space
-# for joint inversion — inspired by KoBold Metals' multi-sensor approach.
+# This exercise combines:
+# 1. **GemPy** — implicit 3D geological modeling from structural observations
+# 2. **NeRF-style decoders** — coordinate-conditioned property prediction
+# 3. **SimPEG** — physics-based forward models (magnetics, gravity)
+# 4. **MC Dropout** — Bayesian uncertainty quantification
 #
-# ### Data Sources
-#
-# | Sensor              | Type            | Coverage          | Physics             |
-# |---------------------|-----------------|-------------------|---------------------|
-# | Airborne magnetics  | Geophysical     | 20×20 grid, z=80m | TMI → susceptibility|
-# | Ground gravity      | Geophysical     | 20×20 grid, z=1m  | gz → density        |
-# | Hyperspectral drone | Remote sensing  | 16×16×10 bands    | Reflectance spectra |
-# | Soil geochemistry   | Geochemical     | 50 samples → grid | Cu,Ni,Co,Fe,S       |
-# | Drill holes         | Direct sampling | 10 holes, 8 each  | Cu,Ni,Co assays     |
-#
-# ### Architecture
+# The key idea: GemPy provides the geological *structure* (where are the
+# unit boundaries), while the NeRF decoders predict continuous *property
+# values* conditioned on that structure. The GemPy scalar field becomes
+# an additional input to each decoder, telling it "how deep are you in
+# this geological unit" and "how close are you to a boundary."
 #
 # ```
-#                ┌──────────────┐
-# Magnetics ────▶│ CNN Branch 1 │──┐
-#                └──────────────┘  │
-#                ┌──────────────┐  │    ┌─────────┐
-# Gravity ──────▶│ CNN Branch 2 │──┼───▶│ FUSION  │──▶ Latent z
-#                └──────────────┘  │    │  MLP    │       │
-#                ┌──────────────┐  │    └─────────┘       │
-# Hyperspectral ▶│ CNN Branch 3 │──┤                      │
-#  (10 bands)    └──────────────┘  │    For each cell (x,y,z):
-#                ┌──────────────┐  │    ┌───────────────────────────────┐
-# Geochemistry ─▶│ CNN Branch 4 │──┘    │         (z, coord)            │
-#  (gridded)     └──────────────┘       │  ┌──────────┐ ┌──────────┐   │
-#                                       │  │DEC_SUSC  │ │DEC_DENS  │   │
-#                                       │  │→ χ_local │ │→ ρ_local │   │
-#                                       │  └────┬─────┘ └────┬─────┘   │
-#                                       │       ▼            ▼         │
-#                                       │  ┌──────────────────────┐    │
-#                                       │  │     DECODER_ILR      │    │
-#                                       │  │ z+coord+χ+ρ → ILR   │    │
-#                                       │  └──────────┬───────────┘    │
-#                                       └─────────────┼────────────────┘
-#                            ┌────────────┬───────────┘
-#                            ▼            ▼
-#                     ┌────────────┐ ┌────────────┐  ┌──────────────┐
-#                     │ FORWARD MAG│ │FORWARD GRAV│  │Loss reconstr.│
-#                     │  G_mag @ χ │ │ G_grav @ Δρ│  │(vs boreholes)│
-#                     └─────┬──────┘ └─────┬──────┘  └──────────────┘
-#                           ▼              ▼
-#                     Loss magnetics  Loss gravity
+#              ┌──────────────────────────────────────────────┐
+#              │              GemPy Structural Model          │
+#              │  contact points + orientations → φ(x,y,z)    │
+#              └──────────────┬───────────────────────────────┘
+#                             │ scalar field φ + unit ID
+#                             ▼
+#              ┌──────────────┐
+# Magnetics ──▶│ CNN Branch 1 │──┐
+#              └──────────────┘  │
+#              ┌──────────────┐  │   ┌─────────┐
+# Gravity ────▶│ CNN Branch 2 │──┼──▶│ FUSION  │──▶ Latent z
+#              └──────────────┘  │   │  MLP    │       │
+#              ┌──────────────┐  │   └─────────┘       │
+# Hyperspect. ▶│ CNN Branch 3 │──┤                     │
+#              └──────────────┘  │     For each cell:   │
+#              ┌──────────────┐  │  ┌──────────────────────────────────┐
+# Geochemistry▶│ CNN Branch 4 │──┘  │  (z, coord, φ(x,y,z), unit_id)  │
+#              └──────────────┘     │  ┌────────┐  ┌────────┐         │
+#                                   │  │DEC_χ   │  │DEC_ρ   │         │
+#                                   │  └───┬────┘  └───┬────┘         │
+#                                   │      ▼           ▼              │
+#                                   │  ┌────────────────────────────┐ │
+#                                   │  │     DECODER_ILR            │ │
+#                                   │  │ z+coord+φ+unit+χ+ρ → ILR   │ │
+#                                   │  └────────────┬───────────────┘ │
+#                                   └───────────────┼─────────────────┘
+#                          ┌────────────┬───────────┘
+#                          ▼            ▼
+#                   ┌────────────┐ ┌────────────┐  ┌──────────────┐
+#                   │ G_mag @ χ  │ │ G_grav @ Δρ│  │Loss reconstr.│
+#                   └─────┬──────┘ └─────┬──────┘  └──────────────┘
+#                         ▼              ▼
+#                   Loss magnetics  Loss gravity
 # ```
 #
 # **Key design choices**:
-# 1. Surface sensors are encoder inputs only — no decoder losses on them
-#    (avoids parasitic autoencoder shortcuts).
-# 2. Coordinate-conditioned decoders (NeRF-style): each cell gets (z, x, y, z)
-#    → chi/rho, with shared weights providing implicit spatial regularization.
-# 3. MC Dropout in decoders — principled Bayesian uncertainty via
-#    approximate variational inference (Gal & Ghahramani, 2016).
-#    Dropout stays active at inference; multiple forward passes sample
-#    the approximate posterior over weights.
+# 1. Surface sensors are encoder inputs only — no decoder losses on them.
+# 2. GemPy scalar field φ provides geological structure to decoders.
+# 3. MC Dropout in decoders for Bayesian uncertainty (Gal & Ghahramani, 2016).
 
 # %% [markdown]
 # ## Setup
@@ -67,15 +62,19 @@
 # %%
 import numpy as np
 import pandas as pd
-import jax
-import jax.numpy as jnp
-from jax import random, grad, jit, vmap
-import flax.linen as nn
-import optax
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from scipy.interpolate import griddata
+
+import gempy as gp
+from gempy.core.data import StructuralFrame
 
 import lets_plot as lp
 lp.LetsPlot.setup_html()
+
+device = torch.device('cpu')
+torch.manual_seed(42)
 
 # %% [markdown]
 # ---
@@ -128,7 +127,6 @@ print(f"Cu: {Cu.min()*100:.2f}% – {Cu.max()*100:.2f}%")
 # ## ILR Transform
 
 # %%
-# Helmert contrast matrix for ILR (isometric log-ratio)
 V_helmert = np.array([
     [np.sqrt(3/4), -1/np.sqrt(12), -1/np.sqrt(12), -1/np.sqrt(12)],
     [0, np.sqrt(2/3), -1/np.sqrt(6), -1/np.sqrt(6)],
@@ -151,13 +149,46 @@ print(f"ILR range: {ilr_true.min():.2f} – {ilr_true.max():.2f}")
 
 # %% [markdown]
 # ---
+# # Part 1b: Borehole Lithological Logs
+#
+# In real exploration, a geologist logs each drill core interval with a
+# lithological classification. We generate these from our synthetic model
+# by thresholding the body intensities.
+
+# %%
+# Define lithologies based on mineralization intensity
+# In reality, a geologist inspects the core and assigns these
+def assign_lithology(body1_val, body2_val):
+    """Assign lithological class based on ore body proximity."""
+    intensity = max(body1_val, body2_val)
+    if intensity > 0.5:
+        return 'massive_sulfide'
+    elif intensity > 0.15:
+        return 'disseminated_sulfide'
+    elif intensity > 0.05:
+        return 'altered_gneiss'
+    else:
+        return 'fresh_gneiss'
+
+lithology_ids = {'fresh_gneiss': 0, 'altered_gneiss': 1,
+                 'disseminated_sulfide': 2, 'massive_sulfide': 3}
+n_lith = len(lithology_ids)
+
+# Assign lithology to every cell (for ground truth)
+cell_lithology = np.array([assign_lithology(body1[i], body2[i]) for i in range(n_cells)])
+cell_lith_id = np.array([lithology_ids[l] for l in cell_lithology])
+
+print("Lithology counts:")
+for name, lid in lithology_ids.items():
+    count = (cell_lith_id == lid).sum()
+    print(f"  {name:25s}: {count:4d} cells ({count/n_cells*100:.1f}%)")
+
+# %% [markdown]
+# ---
 # # Part 2: Multi-Sensor Surveys
 
 # %% [markdown]
 # ## 2a. Airborne Magnetic Survey (TMI)
-#
-# Helicopter-borne magnetometer at 80m flight height.
-# 400 stations on a regular 20×20 grid.
 
 # %%
 rng_np = np.random.default_rng(42)
@@ -182,26 +213,14 @@ sim_mag = magnetics.Simulation3DIntegral(
 )
 
 mag_observed = sim_mag.dpred(susceptibility_true) + rng_np.normal(0, 1.5, len(stations_mag))
-G_mag = sim_mag.G
-G_mag_jax = jnp.array(G_mag)
+G_mag_np = sim_mag.G
+G_mag = torch.tensor(G_mag_np, dtype=torch.float32)
 
 print(f"Magnetic TMI: {mag_observed.min():.1f} – {mag_observed.max():.1f} nT")
 print(f"G_mag shape: {G_mag.shape}")
 
-# %%
-df_mag = pd.DataFrame({'x': stations_mag[:,0], 'y': stations_mag[:,1], 'mag': mag_observed})
-(
-    lp.ggplot(df_mag, lp.aes('x', 'y', fill='mag'))
-    + lp.geom_tile()
-    + lp.scale_fill_gradient2(low='blue', mid='white', high='red', midpoint=0)
-    + lp.labs(title='Airborne Magnetics (TMI)', x='X (m)', y='Y (m)', fill='nT')
-)
-
 # %% [markdown]
 # ## 2b. Ground Gravity Survey (gz)
-#
-# Ground-based gravimeter measuring vertical gravity anomaly.
-# Same horizontal grid, different elevation (z=1m).
 
 # %%
 stations_grav = np.array([[x, y, 1.0] for x in sx_mag for y in sy_mag])
@@ -218,32 +237,15 @@ sim_grav = gravity.Simulation3DIntegral(
 )
 
 grav_observed = sim_grav.dpred(density_true) + rng_np.normal(0, 0.02, len(stations_grav))
-G_grav = sim_grav.G
-G_grav_jax = jnp.array(G_grav)
+G_grav_np = sim_grav.G
+G_grav = torch.tensor(G_grav_np, dtype=torch.float32)
 
 print(f"Gravity gz: {grav_observed.min():.3f} – {grav_observed.max():.3f} mGal")
-print(f"G_grav shape: {G_grav.shape}")
-
-# %%
-df_grav = pd.DataFrame({'x': stations_grav[:,0], 'y': stations_grav[:,1], 'gz': grav_observed})
-(
-    lp.ggplot(df_grav, lp.aes('x', 'y', fill='gz'))
-    + lp.geom_tile()
-    + lp.scale_fill_gradient2(low='blue', mid='white', high='red', midpoint=0)
-    + lp.labs(title='Ground Gravity (gz)', x='X (m)', y='Y (m)', fill='mGal')
-)
 
 # %% [markdown]
 # ## 2c. Hyperspectral Drone Survey
-#
-# Drone-mounted hyperspectral sensor capturing 10 spectral bands
-# from VNIR (0.4 μm) to SWIR (2.5 μm). Alteration minerals around
-# sulfide deposits create diagnostic absorption features.
 
 # %%
-# Surface anomaly model: mineralization halos projected to surface
-# In reality, weathering and supergene enrichment create broader,
-# attenuated surface expressions of deeper deposits.
 surface_xx, surface_yy = np.meshgrid(mesh.cell_centers_x, mesh.cell_centers_y)
 
 d1_surf = np.sqrt(((surface_xx - 1500)/600)**2 + ((surface_yy - 1500)/550)**2)
@@ -252,16 +254,13 @@ body1_surf = np.exp(-d1_surf**2 * 1.5) * 0.4
 d2_surf = np.sqrt(((surface_xx - 2800)/550)**2 + ((surface_yy - 2500)/500)**2)
 body2_surf = np.exp(-d2_surf**2 * 1.5) * 0.25
 
-# Spectral endmembers: reflectance profiles for different surface materials
-# Bands span VNIR to SWIR (iron oxides, clays, carbonates, silica)
 n_bands = 10
 endmember_bg = np.array([0.30, 0.32, 0.35, 0.33, 0.30, 0.28, 0.25, 0.27, 0.30, 0.28])
-endmember_fe = np.array([0.15, 0.22, 0.38, 0.55, 0.68, 0.62, 0.48, 0.42, 0.38, 0.33])  # gossan (iron oxide)
-endmember_clay = np.array([0.40, 0.45, 0.50, 0.52, 0.58, 0.50, 0.40, 0.28, 0.18, 0.22]) # clay alteration
+endmember_fe = np.array([0.15, 0.22, 0.38, 0.55, 0.68, 0.62, 0.48, 0.42, 0.38, 0.33])
+endmember_clay = np.array([0.40, 0.45, 0.50, 0.52, 0.58, 0.50, 0.40, 0.28, 0.18, 0.22])
 
-# Linear spectral mixing at surface
-frac_fe = body1_surf + 0.5 * body2_surf     # iron oxide fraction
-frac_clay = 0.5 * body1_surf + body2_surf   # clay fraction
+frac_fe = body1_surf + 0.5 * body2_surf
+frac_clay = 0.5 * body1_surf + body2_surf
 frac_bg = np.clip(1.0 - frac_fe - frac_clay, 0.1, 1.0)
 total = frac_bg + frac_fe + frac_clay
 frac_bg /= total; frac_fe /= total; frac_clay /= total
@@ -272,88 +271,43 @@ hyper_image = (frac_bg[:,:,None] * endmember_bg +
 hyper_image += rng_np.normal(0, 0.02, hyper_image.shape)
 hyper_image = np.clip(hyper_image, 0, 1)
 
-print(f"Hyperspectral image: {hyper_image.shape} (ny × nx × bands)")
-print(f"Reflectance range: {hyper_image.min():.3f} – {hyper_image.max():.3f}")
-
-# %%
-# Show RGB composite (bands 3, 2, 1) and SWIR (bands 8, 6, 4)
-df_hyper_rgb = pd.DataFrame({
-    'x': surface_xx.ravel(), 'y': surface_yy.ravel(),
-    'band_3': hyper_image[:,:,2].ravel()
-})
-(
-    lp.ggplot(df_hyper_rgb, lp.aes('x', 'y', fill='band_3'))
-    + lp.geom_tile()
-    + lp.scale_fill_gradient(low='#1a1a2e', high='#e94560', name='Refl.')
-    + lp.labs(title='Hyperspectral Band 3 (VNIR red)', x='X (m)', y='Y (m)')
-)
+print(f"Hyperspectral image: {hyper_image.shape}")
 
 # %% [markdown]
-# ## 2d. Surface Geochemistry (Soil Samples)
-#
-# 50 soil samples analyzed for Cu, Ni, Co, Fe, S (ppm or %).
-# Interpolated to a 16×16 grid for the encoder.
+# ## 2d. Surface Geochemistry
 
 # %%
 n_soil = 50
 soil_x = rng_np.uniform(200, nx*dx-200, n_soil)
 soil_y = rng_np.uniform(200, ny*dy-200, n_soil)
 
-# Evaluate surface body intensities at sample locations
 d1_soil = np.sqrt(((soil_x - 1500)/600)**2 + ((soil_y - 1500)/550)**2)
 body1_soil = np.exp(-d1_soil**2 * 1.5) * 0.4
 d2_soil = np.sqrt(((soil_x - 2800)/550)**2 + ((soil_y - 2500)/500)**2)
 body2_soil = np.exp(-d2_soil**2 * 1.5) * 0.25
 
-# Realistic soil geochemistry concentrations with noise
-Cu_soil = 30 + body1_soil * 500 + body2_soil * 300 + rng_np.normal(0, 10, n_soil)  # ppm
-Ni_soil = 20 + body1_soil * 200 + body2_soil * 600 + rng_np.normal(0, 8, n_soil)   # ppm
-Co_soil = 8 + body1_soil * 80 + body2_soil * 200 + rng_np.normal(0, 4, n_soil)     # ppm
-Fe_soil = 3.0 + body1_soil * 5 + body2_soil * 3 + rng_np.normal(0, 0.3, n_soil)    # %
-S_soil = 0.1 + body1_soil * 2 + body2_soil * 1.5 + rng_np.normal(0, 0.05, n_soil)  # %
-Cu_soil = np.clip(Cu_soil, 5, None)
-Ni_soil = np.clip(Ni_soil, 5, None)
-Co_soil = np.clip(Co_soil, 2, None)
+Cu_soil = np.clip(30 + body1_soil * 500 + body2_soil * 300 + rng_np.normal(0, 10, n_soil), 5, None)
+Ni_soil = np.clip(20 + body1_soil * 200 + body2_soil * 600 + rng_np.normal(0, 8, n_soil), 5, None)
+Co_soil = np.clip(8 + body1_soil * 80 + body2_soil * 200 + rng_np.normal(0, 4, n_soil), 2, None)
+Fe_soil = 3.0 + body1_soil * 5 + body2_soil * 3 + rng_np.normal(0, 0.3, n_soil)
+S_soil = 0.1 + body1_soil * 2 + body2_soil * 1.5 + rng_np.normal(0, 0.05, n_soil)
 
-df_soil = pd.DataFrame({
-    'x': soil_x, 'y': soil_y,
-    'Cu_ppm': Cu_soil, 'Ni_ppm': Ni_soil, 'Co_ppm': Co_soil,
-    'Fe_pct': Fe_soil, 'S_pct': S_soil
-})
-
-# Interpolate to 16×16 grid for encoder input
 grid_xy = np.column_stack([surface_xx.ravel(), surface_yy.ravel()])
 soil_points = np.column_stack([soil_x, soil_y])
 
 geochem_grid = np.zeros((nx * ny, 5))
-for i, col in enumerate(['Cu_ppm', 'Ni_ppm', 'Co_ppm', 'Fe_pct', 'S_pct']):
-    vals = df_soil[col].values
+for i, vals in enumerate([Cu_soil, Ni_soil, Co_soil, Fe_soil, S_soil]):
     grid_lin = griddata(soil_points, vals, grid_xy, method='linear')
     grid_near = griddata(soil_points, vals, grid_xy, method='nearest')
     geochem_grid[:, i] = np.where(np.isnan(grid_lin), grid_near, grid_lin)
 
-# Normalize each channel to [0, 1]
 geochem_min = geochem_grid.min(axis=0)
 geochem_max = geochem_grid.max(axis=0)
 geochem_grid_norm = (geochem_grid - geochem_min) / (geochem_max - geochem_min + 1e-8)
 geochem_grid_2d = geochem_grid_norm.reshape(ny, nx, 5)
 
-print(f"Soil samples: {n_soil}")
-print(f"Geochem grid: {geochem_grid_2d.shape} (ny × nx × elements)")
-
-# %%
-(
-    lp.ggplot(df_soil, lp.aes('x', 'y', color='Cu_ppm'))
-    + lp.geom_point(size=4)
-    + lp.scale_color_gradient(low='lightyellow', high='darkred', name='Cu (ppm)')
-    + lp.labs(title='Soil Geochemistry — Cu', x='X (m)', y='Y (m)')
-)
-
 # %% [markdown]
-# ## 2e. Drill Holes
-#
-# 10 diamond drill holes with Cu, Ni, Co assays at 8 depth intervals.
-# DH4 and DH7 are held out for validation.
+# ## 2e. Drill Holes with Lithological Logs
 
 # %%
 hole_xy = [
@@ -362,7 +316,7 @@ hole_xy = [
 ]
 
 validation_holes = {'DH4', 'DH7'}
-noise_rel = 0.05  # 5% relative noise on assays
+noise_rel = 0.05
 
 forages = []
 for i, (hx, hy) in enumerate(hole_xy):
@@ -378,12 +332,15 @@ for i, (hx, hy) in enumerate(hole_xy):
         ilr_noisy = ilr_transform(comp_noisy)[0]
 
         hole_name = f'DH{i+1}'
+        lith = cell_lithology[idx]
         forages.append({
             'hole': hole_name,
             'x': mesh.cell_centers_x[ix], 'y': mesh.cell_centers_y[iy],
             'z': mesh.cell_centers_z[iz],
             'Cu': cu_noisy, 'Ni': ni_noisy, 'Co': co_noisy,
             'ilr0': ilr_noisy[0], 'ilr1': ilr_noisy[1], 'ilr2': ilr_noisy[2],
+            'lithology': lith,
+            'lith_id': lithology_ids[lith],
             'cell_idx': idx,
             'is_validation': hole_name in validation_holes
         })
@@ -393,270 +350,345 @@ df_train = df_forages[~df_forages['is_validation']].reset_index(drop=True)
 df_val = df_forages[df_forages['is_validation']].reset_index(drop=True)
 
 print(f"Drill samples: {len(df_forages)} | train: {len(df_train)} | val: {len(df_val)}")
+print(f"\nLithology log (DH1):")
+dh1 = df_forages[df_forages['hole'] == 'DH1'][['z', 'lithology', 'Cu']].reset_index(drop=True)
+for _, row in dh1.iterrows():
+    print(f"  z={row['z']:7.0f}m  {row['lithology']:25s}  Cu={row['Cu']*100:.2f}%")
 
 # %% [markdown]
 # ---
-# # Part 3: Differentiable Forward Models (JAX)
+# # Part 2f: GemPy Structural Model
 #
-# Both forward problems are linear, so we use the sensitivity matrices
-# extracted from SimPEG for exact, differentiable forward modeling.
+# We build a GemPy geological model from the drill hole lithological logs.
+# In a real project, a geologist would pick contact points where lithology
+# changes in core, and estimate orientations from multiple holes. Here we
+# extract these automatically from our synthetic borehole data.
+#
+# GemPy interpolates a scalar potential field φ(x,y,z) that defines
+# the geological unit boundaries. This scalar field becomes an input
+# to our NeRF decoders — it tells the network WHERE geological
+# boundaries are, so the network can focus on WHAT properties exist
+# within each unit.
 
 # %%
-@jit
-def forward_magnetic_jax(susceptibility):
+# Extract contact points from drill holes: locations where lithology changes
+contacts = []
+orientations_data = []
+
+for hole_name in df_forages['hole'].unique():
+    dh = df_forages[df_forages['hole'] == hole_name].sort_values('z', ascending=False)
+    rows = dh.reset_index(drop=True)
+
+    for j in range(len(rows) - 1):
+        if rows.loc[j, 'lith_id'] != rows.loc[j+1, 'lith_id']:
+            # Contact midpoint between the two intervals
+            cx = float(rows.loc[j, 'x'])
+            cy = float(rows.loc[j, 'y'])
+            cz = float((rows.loc[j, 'z'] + rows.loc[j+1, 'z']) / 2)
+            contacts.append({
+                'x': cx, 'y': cy, 'z': cz,
+                'surface': 'ore_contact'
+            })
+
+# Need at least a few points. Add surface reference points (host rock at surface)
+for x_ref in [500, 2000, 3500]:
+    for y_ref in [500, 2000, 3500]:
+        contacts.append({'x': float(x_ref), 'y': float(y_ref), 'z': -62.5,
+                         'surface': 'surface_ref'})
+
+df_contacts = pd.DataFrame(contacts)
+print(f"Contact points extracted: {len(df_contacts)}")
+print(f"  ore_contact: {(df_contacts['surface']=='ore_contact').sum()}")
+print(f"  surface_ref: {(df_contacts['surface']=='surface_ref').sum()}")
+
+# %%
+# Build GemPy model
+geo_model = gp.create_geomodel(
+    project_name='sulfide_exploration',
+    extent=[0, 4000, 0, 4000, -1000, 0],
+    resolution=[16, 16, 8],
+    structural_frame=StructuralFrame.initialize_default_structure()
+)
+
+# Add surface contact points
+ore_contacts = df_contacts[df_contacts['surface'] == 'ore_contact']
+if len(ore_contacts) > 0:
+    gp.add_surface_points(
+        geo_model,
+        x=ore_contacts['x'].tolist(),
+        y=ore_contacts['y'].tolist(),
+        z=ore_contacts['z'].tolist(),
+        elements_names=['surface1'] * len(ore_contacts)
+    )
+
+# Add orientations (vertical for our case — bodies are roughly horizontal lenses)
+# In reality, a geologist would estimate these from core and structural measurements
+gp.add_orientations(
+    geo_model,
+    x=[1500.0, 2800.0],
+    y=[1500.0, 2500.0],
+    z=[-500.0, -700.0],
+    elements_names=['surface1', 'surface1'],
+    pole_vector=[[0, 0, 1], [0, 0, 1]]
+)
+
+geo_model.update_transform()
+
+# Compute structural model
+print("Computing GemPy structural model...")
+sol = gp.compute_model(geo_model)
+print("GemPy model computed.")
+
+# %%
+# Extract scalar field at all cell centers using custom grid
+gp.set_custom_grid(geo_model.grid, cc.astype(np.float64))
+sol = gp.compute_model(geo_model)
+
+# Get scalar field values from the octree output
+oo0 = sol.octrees_output[0]
+gc0 = oo0.grid_centers
+oc0 = oo0.output_centers
+ef0 = oc0.exported_fields
+
+custom_slice = gc0.custom_grid_slice
+scalar_field_at_cells = np.array(ef0.scalar_field[custom_slice])
+
+# Normalize scalar field to [0, 1] for use as network input
+sf_min, sf_max = scalar_field_at_cells.min(), scalar_field_at_cells.max()
+if sf_max > sf_min:
+    scalar_field_norm = (scalar_field_at_cells - sf_min) / (sf_max - sf_min)
+else:
+    scalar_field_norm = np.zeros_like(scalar_field_at_cells)
+
+print(f"Scalar field: {scalar_field_at_cells.min():.4f} – {scalar_field_at_cells.max():.4f}")
+print(f"Normalized:   {scalar_field_norm.min():.4f} – {scalar_field_norm.max():.4f}")
+
+# Get lithology IDs from GemPy
+gempy_lith_ids = np.array(oc0.ids_custom_grid, dtype=np.int32)
+print(f"GemPy lithology IDs: unique = {np.unique(gempy_lith_ids)}")
+
+# %% [markdown]
+# ---
+# # Part 3: Differentiable Forward Models
+
+# %%
+def forward_magnetic(susceptibility):
     """Forward magnetics: TMI = G_mag @ χ"""
-    return G_mag_jax @ susceptibility
+    return G_mag @ susceptibility
 
-@jit
-def forward_gravity_jax(density):
+def forward_gravity(density):
     """Forward gravity: gz = G_grav @ Δρ"""
-    return G_grav_jax @ density
-
-# Verify forward models
-mag_test = forward_magnetic_jax(jnp.array(susceptibility_true))
-grav_test = forward_gravity_jax(jnp.array(density_true))
-print(f"Forward magnetics: {float(mag_test.min()):.1f} – {float(mag_test.max()):.1f} nT")
-print(f"Forward gravity:   {float(grav_test.min()):.4f} – {float(grav_test.max()):.4f} mGal")
+    return G_grav @ density
 
 # %% [markdown]
 # ---
-# # Part 4: Network Architecture
+# # Part 4: Network Architecture (PyTorch)
 #
-# Multi-modal encoder with separate branches for each sensor,
-# fused through a shared MLP into a single latent space.
-# Two physical property decoders + one composition decoder.
-
-# %%
-# Custom activation functions with gradient floors to prevent "gradient death".
-# When the ILR reconstruction loss (lambda=10) dominates, it pushes softplus
-# pre-activations very negative. Standard softplus derivative (sigmoid) → 0
-# there, permanently killing the decoder. The custom VJP ensures a minimum
-# backward gradient of 0.01, keeping all decoders trainable throughout.
-
-@jax.custom_vjp
-def safe_softplus(x):
-    """Forward: standard softplus. Backward: gradient floor at 0.01."""
-    return jax.nn.softplus(x)
-
-def _sp_fwd(x):
-    return jax.nn.softplus(x), x
-
-def _sp_bwd(x, g):
-    return (g * jnp.maximum(jax.nn.sigmoid(x), 0.01),)
-
-safe_softplus.defvjp(_sp_fwd, _sp_bwd)
+# Multi-modal encoder fuses 4 sensor types into a latent vector.
+# NeRF-style decoders take (z, coord, φ_gempy, unit_embedding) → properties.
+# MC Dropout in decoders for Bayesian uncertainty.
 
 # %%
 class MultiModalEncoder(nn.Module):
     """
     Fuses magnetic, gravity, hyperspectral, and geochemistry inputs
-    into a shared latent distribution (VAE-style).
+    into a shared latent vector.
     """
-    latent_dim: int = 32
+    def __init__(self, latent_dim=32, n_mag=20, n_hyper_bands=10):
+        super().__init__()
+        self.latent_dim = latent_dim
 
-    @nn.compact
-    def __call__(self, mag_grid, grav_grid, hyper_img, geochem_grid):
-        # --- Magnetic branch: (20, 20) → 64 features ---
-        m = mag_grid[jnp.newaxis, :, :, jnp.newaxis]
-        m = nn.Conv(16, kernel_size=(3, 3), padding='SAME')(m)
-        m = nn.relu(m)
-        m = nn.Conv(32, kernel_size=(3, 3), padding='SAME')(m)
-        m = nn.relu(m)
-        m = m.ravel()
-        m = nn.Dense(64)(m)
-        m = nn.relu(m)
+        # Magnetic branch: (1, 20, 20) → 64
+        self.mag_conv1 = nn.Conv2d(1, 16, 3, padding=1)
+        self.mag_conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.mag_fc = nn.Linear(32 * n_mag * n_mag, 64)
 
-        # --- Gravity branch: (20, 20) → 64 features ---
-        g = grav_grid[jnp.newaxis, :, :, jnp.newaxis]
-        g = nn.Conv(16, kernel_size=(3, 3), padding='SAME')(g)
-        g = nn.relu(g)
-        g = nn.Conv(32, kernel_size=(3, 3), padding='SAME')(g)
-        g = nn.relu(g)
-        g = g.ravel()
-        g = nn.Dense(64)(g)
-        g = nn.relu(g)
+        # Gravity branch: (1, 20, 20) → 64
+        self.grav_conv1 = nn.Conv2d(1, 16, 3, padding=1)
+        self.grav_conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.grav_fc = nn.Linear(32 * n_mag * n_mag, 64)
 
-        # --- Hyperspectral branch: (16, 16, 10) → 64 features ---
-        h = hyper_img[jnp.newaxis, :, :, :]
-        h = nn.Conv(16, kernel_size=(3, 3), padding='SAME')(h)
-        h = nn.relu(h)
-        h = nn.Conv(32, kernel_size=(3, 3), padding='SAME')(h)
-        h = nn.relu(h)
-        h = h.ravel()
-        h = nn.Dense(64)(h)
-        h = nn.relu(h)
+        # Hyperspectral branch: (10, 16, 16) → 64
+        self.hyper_conv1 = nn.Conv2d(n_hyper_bands, 16, 3, padding=1)
+        self.hyper_conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.hyper_fc = nn.Linear(32 * 16 * 16, 64)
 
-        # --- Geochemistry branch: (16, 16, 5) → 32 features ---
-        c = geochem_grid[jnp.newaxis, :, :, :]
-        c = nn.Conv(16, kernel_size=(3, 3), padding='SAME')(c)
-        c = nn.relu(c)
-        c = c.ravel()
-        c = nn.Dense(32)(c)
-        c = nn.relu(c)
+        # Geochemistry branch: (5, 16, 16) → 32
+        self.geochem_conv = nn.Conv2d(5, 16, 3, padding=1)
+        self.geochem_fc = nn.Linear(16 * 16 * 16, 32)
 
-        # --- Fusion MLP ---
-        fused = jnp.concatenate([m, g, h, c])  # 64+64+64+32 = 224
-        fused = nn.Dense(128)(fused)
-        fused = nn.relu(fused)
-        fused = nn.Dense(64)(fused)
-        fused = nn.relu(fused)
+        # Fusion MLP: 224 → 128 → 64 → latent
+        self.fusion = nn.Sequential(
+            nn.Linear(224, 128), nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
+        )
+        self.mu_head = nn.Linear(64, latent_dim)
+        self.logvar_head = nn.Linear(64, latent_dim)
 
-        mu = nn.Dense(self.latent_dim)(fused)
-        log_var = nn.Dense(self.latent_dim)(fused)
-        return mu, log_var
+    def forward(self, mag_grid, grav_grid, hyper_img, geochem_grid):
+        # mag_grid: (20, 20) → (1, 1, 20, 20)
+        m = F.gelu(self.mag_conv1(mag_grid.unsqueeze(0).unsqueeze(0)))
+        m = F.gelu(self.mag_conv2(m))
+        m = F.gelu(self.mag_fc(m.flatten()))
+
+        g = F.gelu(self.grav_conv1(grav_grid.unsqueeze(0).unsqueeze(0)))
+        g = F.gelu(self.grav_conv2(g))
+        g = F.gelu(self.grav_fc(g.flatten()))
+
+        # hyper_img: (16, 16, 10) → (1, 10, 16, 16)
+        h = hyper_img.permute(2, 0, 1).unsqueeze(0)
+        h = F.gelu(self.hyper_conv1(h))
+        h = F.gelu(self.hyper_conv2(h))
+        h = F.gelu(self.hyper_fc(h.flatten()))
+
+        # geochem: (16, 16, 5) → (1, 5, 16, 16)
+        c = geochem_grid.permute(2, 0, 1).unsqueeze(0)
+        c = F.gelu(self.geochem_conv(c))
+        c = F.gelu(self.geochem_fc(c.flatten()))
+
+        fused = torch.cat([m, g, h, c])  # 64+64+64+32 = 224
+        fused = self.fusion(fused)
+        return self.mu_head(fused), self.logvar_head(fused)
 
 
 class DecoderSusceptibility(nn.Module):
     """
-    (latent, coord_norm) → χ_local (scalar).
-    Coordinate-conditioned decoder (NeRF-style): each cell gets
-    a position-dependent prediction from the shared latent vector.
-    Weight sharing across all cells provides implicit spatial regularization.
-    safe_softplus prevents gradient death from ILR loss dominance.
-    MC Dropout provides Bayesian uncertainty (Gal & Ghahramani, 2016).
+    (latent, coord_norm, φ_gempy, unit_embedding) → χ_local.
+    GemPy scalar field provides geological structure awareness.
+    MC Dropout for Bayesian uncertainty.
     """
-    dropout_rate: float = 0.1
+    def __init__(self, latent_dim=32, n_units=4, embed_dim=4, dropout=0.1):
+        super().__init__()
+        self.unit_embed = nn.Embedding(n_units, embed_dim)
+        input_dim = latent_dim + 3 + 1 + embed_dim  # z + coord + φ + unit_emb
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(64, 32), nn.ReLU(),
+            nn.Linear(32, 1),
+        )
 
-    @nn.compact
-    def __call__(self, latent, coord_norm, deterministic=True):
-        x = jnp.concatenate([latent, coord_norm])
-        x = nn.Dense(128)(x)
-        x = nn.relu(x)
-        x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
-        x = nn.Dense(64)(x)
-        x = nn.relu(x)
-        x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
-        x = nn.Dense(32)(x)
-        x = nn.relu(x)
-        return safe_softplus(nn.Dense(1)(x).squeeze()) * 0.01
+    def forward(self, latent, coord, phi, unit_id):
+        """
+        latent: (latent_dim,) or (N, latent_dim)
+        coord: (3,) or (N, 3)
+        phi: scalar or (N,)
+        unit_id: int or (N,) long tensor
+        """
+        u_emb = self.unit_embed(unit_id)
+        if phi.dim() == 0:
+            phi = phi.unsqueeze(0)
+        if phi.dim() == 1 and latent.dim() == 1:
+            x = torch.cat([latent, coord, phi, u_emb])
+        else:
+            x = torch.cat([latent, coord, phi.unsqueeze(-1) if phi.dim() == 1 else phi, u_emb], dim=-1)
+        return F.softplus(self.net(x).squeeze(-1)) * 0.01
 
 
 class DecoderDensity(nn.Module):
-    """
-    (latent, coord_norm) → Δρ_local (scalar).
-    Same coordinate-conditioned architecture as susceptibility decoder.
-    safe_softplus prevents gradient death from ILR loss dominance.
-    MC Dropout provides Bayesian uncertainty (Gal & Ghahramani, 2016).
-    """
-    dropout_rate: float = 0.1
+    """(latent, coord_norm, φ_gempy, unit_embedding) → Δρ_local."""
+    def __init__(self, latent_dim=32, n_units=4, embed_dim=4, dropout=0.1):
+        super().__init__()
+        self.unit_embed = nn.Embedding(n_units, embed_dim)
+        input_dim = latent_dim + 3 + 1 + embed_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(64, 32), nn.ReLU(),
+            nn.Linear(32, 1),
+        )
 
-    @nn.compact
-    def __call__(self, latent, coord_norm, deterministic=True):
-        x = jnp.concatenate([latent, coord_norm])
-        x = nn.Dense(128)(x)
-        x = nn.relu(x)
-        x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
-        x = nn.Dense(64)(x)
-        x = nn.relu(x)
-        x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
-        x = nn.Dense(32)(x)
-        x = nn.relu(x)
-        return safe_softplus(nn.Dense(1)(x).squeeze()) * 0.1
+    def forward(self, latent, coord, phi, unit_id):
+        u_emb = self.unit_embed(unit_id)
+        if phi.dim() == 0:
+            phi = phi.unsqueeze(0)
+        if phi.dim() == 1 and latent.dim() == 1:
+            x = torch.cat([latent, coord, phi, u_emb])
+        else:
+            x = torch.cat([latent, coord, phi.unsqueeze(-1) if phi.dim() == 1 else phi, u_emb], dim=-1)
+        return F.softplus(self.net(x).squeeze(-1)) * 0.1
 
 
 class DecoderILR(nn.Module):
     """
-    Latent + local physical properties + coordinates → ILR compositions.
-    Both chi_local and rho_local provide direct physical bridges from
-    the geophysical inversion to compositional prediction.
-    MC Dropout provides Bayesian uncertainty (Gal & Ghahramani, 2016).
+    (latent, coord, φ, unit_id, χ, ρ) → ILR compositions (3-dim).
+    Receives physical properties as inputs — bridges geophysics to geochemistry.
     """
-    dropout_rate: float = 0.1
+    def __init__(self, latent_dim=32, n_units=4, embed_dim=4, dropout=0.1):
+        super().__init__()
+        self.unit_embed = nn.Embedding(n_units, embed_dim)
+        input_dim = latent_dim + 3 + 1 + embed_dim + 2  # + chi_scaled + rho_scaled
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(64, 32), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(32, 3),
+        )
 
-    @nn.compact
-    def __call__(self, latent, coord_norm, chi_local, rho_local, deterministic=True):
-        x = jnp.concatenate([latent, coord_norm,
-                             jnp.atleast_1d(chi_local * 100),
-                             jnp.atleast_1d(rho_local * 10)])
-        x = nn.Dense(64)(x)
-        x = nn.relu(x)
-        x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
-        x = nn.Dense(32)(x)
-        x = nn.relu(x)
-        x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
-        return nn.Dense(3)(x)
+    def forward(self, latent, coord, phi, unit_id, chi_local, rho_local):
+        u_emb = self.unit_embed(unit_id)
+        if phi.dim() == 0:
+            phi = phi.unsqueeze(0)
+
+        # Scale physical properties to similar magnitude as other inputs
+        chi_s = (chi_local * 100).unsqueeze(-1) if chi_local.dim() == 1 else (chi_local * 100)
+        rho_s = (rho_local * 10).unsqueeze(-1) if rho_local.dim() == 1 else (rho_local * 10)
+
+        if latent.dim() == 1:
+            x = torch.cat([latent, coord, phi, u_emb, chi_s, rho_s])
+        else:
+            x = torch.cat([latent, coord,
+                           phi.unsqueeze(-1) if phi.dim() == 1 else phi,
+                           u_emb, chi_s, rho_s], dim=-1)
+        return self.net(x)
 
 
-# NOTE: We deliberately do NOT add decoders for hyperspectral and geochemistry.
-# These surface observations are encoder inputs only. Adding decoder losses
-# on them creates a parasitic autoencoder shortcut: the encoder sees the data
-# and a decoder reconstructs that same data → trivially minimized without
-# learning anything about the subsurface. The latent space must be shaped
-# by SUBSURFACE targets (forward models + borehole compositions).
+# NOTE: No decoders for hyperspectral/geochemistry — surface observations
+# are encoder inputs only, to avoid parasitic autoencoder shortcuts.
 
 # %% [markdown]
 # ---
 # # Part 5: Multi-Physics Loss Function
-#
-# Loss targets are SUBSURFACE quantities only:
-# - **Magnetics / Gravity**: physics-based forward model losses (G @ property)
-# - **Drill holes**: ILR composition reconstruction loss
-#
-# No explicit smoothness/smallness regularization is needed: the
-# coordinate-conditioned MLP decoders share weights across all cells,
-# providing implicit spatial regularization (similar to NeRF).
 
 # %%
-def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
-            mag_grid, grav_grid, hyper_img, geochem_grid,
-            mag_observed, grav_observed,
-            all_coords_norm, train_coords_norm, train_ilr, train_ilr_std, train_cell_idx,
-            rng_key,
+def loss_fn(encoder, dec_susc, dec_dens, dec_ilr,
+            mag_grid_t, grav_grid_t, hyper_t, geochem_t,
+            mag_obs_t, grav_obs_t,
+            all_coords_t, all_phi_t, all_unit_ids_t,
+            train_coords_t, train_phi_t, train_unit_ids_t,
+            train_ilr_t, train_ilr_std_t, train_cell_idx,
             lambda_recon=10.0, lambda_mag=1.0, lambda_grav=0.3):
     """
-    Multi-physics loss with subsurface-only targets:
-    - Magnetic forward:    ||G_mag @ χ - mag_obs||² / var      (physics)
-    - Gravity forward:     ||G_grav @ Δρ - grav_obs||² / var   (physics)
-    - ILR reconstruction:  ||dec_ilr(z,χ,ρ,xyz) - ilr_obs||²   (borehole)
-
-    Surface data (hyperspectral, geochemistry) are encoder inputs only —
-    NO decoder losses on them (avoids parasitic autoencoder shortcuts).
-    Deterministic encoder (no VAE sampling / KL) — avoids KL fighting recon.
-    MC Dropout active during training (deterministic=False) for Bayesian UQ.
+    Multi-physics loss with GemPy structural conditioning.
+    Dropout is active during training (model.train() mode).
     """
+    # --- Encode → deterministic latent ---
+    mu, log_var = encoder(mag_grid_t, grav_grid_t, hyper_t, geochem_t)
+    z = mu  # deterministic
 
-    # --- Encode (all 4 surface sensors) → deterministic latent ---
-    mu, log_var = encoder.apply(params['encoder'],
-                                mag_grid, grav_grid, hyper_img, geochem_grid)
-    z = mu  # deterministic — no sampling, no KL
+    # --- Decode at ALL cells (z broadcast to each cell) ---
+    z_expanded = z.unsqueeze(0).expand(all_coords_t.shape[0], -1)
+    chi_pred = dec_susc(z_expanded, all_coords_t, all_phi_t, all_unit_ids_t)
+    rho_pred = dec_dens(z_expanded, all_coords_t, all_phi_t, all_unit_ids_t)
 
-    # --- Split RNG for MC Dropout in each decoder ---
-    rng_chi, rng_rho, rng_ilr = random.split(rng_key, 3)
-    keys_chi = random.split(rng_chi, all_coords_norm.shape[0])
-    keys_rho = random.split(rng_rho, all_coords_norm.shape[0])
+    # --- Forward physics ---
+    mag_pred = forward_magnetic(chi_pred)
+    grav_pred = forward_gravity(rho_pred)
 
-    # --- Decode physical properties at ALL cell locations (dropout active) ---
-    chi_pred = vmap(lambda c, k: dec_susc.apply(
-        params['dec_susc'], z, c, deterministic=False,
-        rngs={'dropout': k}))(all_coords_norm, keys_chi)
-    rho_pred = vmap(lambda c, k: dec_dens.apply(
-        params['dec_dens'], z, c, deterministic=False,
-        rngs={'dropout': k}))(all_coords_norm, keys_rho)
+    loss_mag = torch.mean((mag_pred - mag_obs_t)**2) / torch.var(mag_obs_t)
+    loss_grav = torch.mean((grav_pred - grav_obs_t)**2) / torch.var(grav_obs_t)
 
-    # --- Forward models (PINN) — geophysical consistency ---
-    mag_pred = forward_magnetic_jax(chi_pred)
-    grav_pred = forward_gravity_jax(rho_pred)
-
-    loss_mag = jnp.mean((mag_pred - mag_observed)**2) / jnp.var(mag_observed)
-    loss_grav = jnp.mean((grav_pred - grav_observed)**2) / jnp.var(grav_observed)
-
-    # --- Decode ILR at drill hole locations (dropout active) ---
+    # --- Decode ILR at drill holes ---
     chi_at_train = chi_pred[train_cell_idx]
     rho_at_train = rho_pred[train_cell_idx]
-    keys_ilr = random.split(rng_ilr, train_coords_norm.shape[0])
 
-    def predict_ilr(coord, chi_local, rho_local, k):
-        return dec_ilr.apply(params['dec_ilr'], z, coord, chi_local, rho_local,
-                             deterministic=False, rngs={'dropout': k})
+    z_train = z.unsqueeze(0).expand(train_coords_t.shape[0], -1)
+    ilr_pred = dec_ilr(z_train, train_coords_t, train_phi_t,
+                       train_unit_ids_t, chi_at_train, rho_at_train)
 
-    ilr_pred = vmap(predict_ilr)(train_coords_norm, chi_at_train, rho_at_train, keys_ilr)
-    loss_recon = jnp.mean(((ilr_pred - train_ilr) / train_ilr_std)**2)
+    loss_recon = torch.mean(((ilr_pred - train_ilr_t) / train_ilr_std_t)**2)
 
-    # --- Rho bounding penalty ---
-    # safe_softplus gradient floor prevents rho from settling to zero,
-    # but can allow unbounded growth. Sum-based (not mean) penalty avoids
-    # dilution across 2048 cells when only a few explode.
-    loss_rho_bound = jnp.sum(jnp.maximum(rho_pred - 0.25, 0.0)**2)
+    # --- Rho bounding penalty (sum-based) ---
+    loss_rho_bound = torch.sum(torch.clamp(rho_pred - 0.25, min=0.0)**2)
 
     # --- Total ---
     loss_total = (lambda_recon * loss_recon
@@ -665,10 +697,10 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
                   + 1.0 * loss_rho_bound)
 
     return loss_total, {
-        'total': loss_total, 'recon': loss_recon,
-        'mag': loss_mag, 'grav': loss_grav,
-        'chi_max': jnp.max(chi_pred), 'rho_max': jnp.max(rho_pred),
-        'rho_bnd': loss_rho_bound
+        'total': loss_total.item(), 'recon': loss_recon.item(),
+        'mag': loss_mag.item(), 'grav': loss_grav.item(),
+        'chi_max': chi_pred.max().item(), 'rho_max': rho_pred.max().item(),
+        'rho_bnd': loss_rho_bound.item()
     }
 
 # %% [markdown]
@@ -676,99 +708,101 @@ def loss_fn(params, encoder, dec_susc, dec_dens, dec_ilr,
 # # Part 6: Training
 
 # %%
-# Initialize all modules
-rng = random.PRNGKey(42)
-rng, *init_rngs = random.split(rng, 5)
-
+# Initialize models
 latent_dim = 32
 encoder = MultiModalEncoder(latent_dim=latent_dim)
-dec_susc = DecoderSusceptibility()
-dec_dens = DecoderDensity()
-dec_ilr = DecoderILR()
+dec_susc = DecoderSusceptibility(latent_dim=latent_dim, n_units=n_lith)
+dec_dens = DecoderDensity(latent_dim=latent_dim, n_units=n_lith)
+dec_ilr = DecoderILR(latent_dim=latent_dim, n_units=n_lith)
 
-# Dummy inputs for initialization
-dummy_mag = jnp.zeros((n_stations_mag, n_stations_mag))
-dummy_grav = jnp.zeros((n_stations_mag, n_stations_mag))
-dummy_hyper = jnp.zeros((ny, nx, n_bands))
-dummy_geochem = jnp.zeros((ny, nx, 5))
-dummy_latent = jnp.zeros(latent_dim)
-dummy_coord = jnp.zeros(3)
-dummy_chi = jnp.float32(0.0)
-dummy_rho = jnp.float32(0.0)
-
-params = {
-    'encoder': encoder.init(init_rngs[0], dummy_mag, dummy_grav, dummy_hyper, dummy_geochem),
-    'dec_susc': dec_susc.init(init_rngs[1], dummy_latent, dummy_coord),
-    'dec_dens': dec_dens.init(init_rngs[2], dummy_latent, dummy_coord),
-    'dec_ilr': dec_ilr.init(init_rngs[3], dummy_latent, dummy_coord, dummy_chi, dummy_rho),
-}
+# Count parameters
+n_params = sum(p.numel() for p in encoder.parameters())
+n_params += sum(p.numel() for m in [dec_susc, dec_dens, dec_ilr] for p in m.parameters())
+print(f"Total parameters: {n_params:,}")
 
 # %%
 # Prepare data tensors
-mag_grid = jnp.array(mag_observed.reshape(n_stations_mag, n_stations_mag))
-mag_grid_norm = (mag_grid - mag_grid.mean()) / (mag_grid.std() + 1e-6)
+mag_grid_t = torch.tensor(mag_observed.reshape(n_stations_mag, n_stations_mag), dtype=torch.float32)
+mag_grid_t = (mag_grid_t - mag_grid_t.mean()) / (mag_grid_t.std() + 1e-6)
 
-grav_grid = jnp.array(grav_observed.reshape(n_stations_mag, n_stations_mag))
-grav_grid_norm = (grav_grid - grav_grid.mean()) / (grav_grid.std() + 1e-6)
+grav_grid_t = torch.tensor(grav_observed.reshape(n_stations_mag, n_stations_mag), dtype=torch.float32)
+grav_grid_t = (grav_grid_t - grav_grid_t.mean()) / (grav_grid_t.std() + 1e-6)
 
-hyper_img_jax = jnp.array(hyper_image)
-geochem_grid_jax = jnp.array(geochem_grid_2d)
+hyper_t = torch.tensor(hyper_image, dtype=torch.float32)
+geochem_t = torch.tensor(geochem_grid_2d, dtype=torch.float32)
 
-mag_obs_jax = jnp.array(mag_observed)
-grav_obs_jax = jnp.array(grav_observed)
+mag_obs_t = torch.tensor(mag_observed, dtype=torch.float32)
+grav_obs_t = torch.tensor(grav_observed, dtype=torch.float32)
 
-# Coordinates (normalized) — for all cells and drill holes
-coord_mean = jnp.array([nx*dx/2, ny*dy/2, -nz*dz/2])
-coord_std = jnp.array([nx*dx/2, ny*dy/2, nz*dz/2])
-all_coords_norm = jnp.array((cc - np.array(coord_mean)) / np.array(coord_std))
-train_coords_norm = jnp.array((df_train[['x', 'y', 'z']].values - np.array(coord_mean)) / np.array(coord_std))
-train_ilr = jnp.array(df_train[['ilr0', 'ilr1', 'ilr2']].values)
-train_ilr_std = jnp.std(train_ilr, axis=0)  # per-dimension std for loss normalization
-train_cell_idx = jnp.array(df_train['cell_idx'].values, dtype=jnp.int32)
+# Coordinates (normalized)
+coord_mean = np.array([nx*dx/2, ny*dy/2, -nz*dz/2])
+coord_std = np.array([nx*dx/2, ny*dy/2, nz*dz/2])
+all_coords_t = torch.tensor((cc - coord_mean) / coord_std, dtype=torch.float32)
+all_phi_t = torch.tensor(scalar_field_norm, dtype=torch.float32)
+all_unit_ids_t = torch.tensor(cell_lith_id, dtype=torch.long)
 
-val_coords_norm = jnp.array((df_val[['x', 'y', 'z']].values - np.array(coord_mean)) / np.array(coord_std))
-val_ilr = jnp.array(df_val[['ilr0', 'ilr1', 'ilr2']].values)
-val_cell_idx = jnp.array(df_val['cell_idx'].values, dtype=jnp.int32)
+train_coords_t = torch.tensor((df_train[['x', 'y', 'z']].values - coord_mean) / coord_std, dtype=torch.float32)
+train_ilr_t = torch.tensor(df_train[['ilr0', 'ilr1', 'ilr2']].values, dtype=torch.float32)
+train_ilr_std_t = train_ilr_t.std(dim=0)
+train_cell_idx = torch.tensor(df_train['cell_idx'].values, dtype=torch.long)
+
+# GemPy features for train drill holes
+train_phi_t = all_phi_t[train_cell_idx]
+train_unit_ids_t = all_unit_ids_t[train_cell_idx]
+
+val_coords_t = torch.tensor((df_val[['x', 'y', 'z']].values - coord_mean) / coord_std, dtype=torch.float32)
+val_ilr_t = torch.tensor(df_val[['ilr0', 'ilr1', 'ilr2']].values, dtype=torch.float32)
+val_cell_idx = torch.tensor(df_val['cell_idx'].values, dtype=torch.long)
 
 print("Data prepared for training")
 
 # %%
-# Optimizer with warmup cosine decay
+# Optimizer with cosine annealing
 n_epochs = 25000
-schedule = optax.warmup_cosine_decay_schedule(
-    init_value=1e-4,
-    peak_value=2e-3,
-    warmup_steps=500,
-    decay_steps=n_epochs
-)
-optimizer = optax.adam(schedule)
-opt_state = optimizer.init(params)
+all_params = (list(encoder.parameters()) + list(dec_susc.parameters())
+              + list(dec_dens.parameters()) + list(dec_ilr.parameters()))
+optimizer = torch.optim.Adam(all_params, lr=2e-3)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=n_epochs, eta_min=1e-5)
 
-@jit
-def train_step(params, opt_state, rng_key):
-    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-        params, encoder, dec_susc, dec_dens, dec_ilr,
-        mag_grid_norm, grav_grid_norm, hyper_img_jax, geochem_grid_jax,
-        mag_obs_jax, grav_obs_jax,
-        all_coords_norm, train_coords_norm, train_ilr, train_ilr_std, train_cell_idx,
-        rng_key,
-        lambda_recon=10.0,
-        lambda_mag=1.0,
-        lambda_grav=0.3
-    )
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    params = optax.apply_updates(params, updates)
-    return params, opt_state, loss, aux
+# Manual warmup for first 500 steps
+warmup_steps = 500
 
 # %%
 # Training loop
 history = []
 
-for epoch in range(n_epochs):
-    rng, step_rng = random.split(rng)
+encoder.train()
+dec_susc.train()
+dec_dens.train()
+dec_ilr.train()
 
-    params, opt_state, loss, aux = train_step(params, opt_state, step_rng)
-    history.append({**{k: float(v) for k, v in aux.items()}, 'epoch': epoch})
+for epoch in range(n_epochs):
+    # Warmup: linearly increase LR from 1e-4 to 2e-3
+    if epoch < warmup_steps:
+        lr = 1e-4 + (2e-3 - 1e-4) * epoch / warmup_steps
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr
+
+    optimizer.zero_grad()
+
+    loss, aux = loss_fn(
+        encoder, dec_susc, dec_dens, dec_ilr,
+        mag_grid_t, grav_grid_t, hyper_t, geochem_t,
+        mag_obs_t, grav_obs_t,
+        all_coords_t, all_phi_t, all_unit_ids_t,
+        train_coords_t, train_phi_t, train_unit_ids_t,
+        train_ilr_t, train_ilr_std_t, train_cell_idx,
+        lambda_recon=10.0, lambda_mag=1.0, lambda_grav=0.3
+    )
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+    optimizer.step()
+
+    if epoch >= warmup_steps:
+        scheduler.step()
+
+    history.append({**aux, 'epoch': epoch})
 
     if epoch % 2500 == 0:
         print(f"Epoch {epoch:5d} | loss={aux['total']:.4f} | recon={aux['recon']:.4f} | "
@@ -790,19 +824,24 @@ df_hist = pd.DataFrame(history)
 
 # %% [markdown]
 # ---
-# # Part 7: Predictions
+# # Part 7: Predictions with MC Dropout Uncertainty
 
 # %%
-# Encode → latent (deterministic, using mean)
-mu, log_var = encoder.apply(params['encoder'],
-                            mag_grid_norm, grav_grid_norm,
-                            hyper_img_jax, geochem_grid_jax)
+# Deterministic predictions (dropout off)
+encoder.eval()
+dec_susc.eval()
+dec_dens.eval()
+dec_ilr.eval()
 
-# Decode physical properties at all cell locations (dropout off = deterministic mean)
-chi_pred = vmap(lambda c: dec_susc.apply(params['dec_susc'], mu, c, deterministic=True))(all_coords_norm)
-rho_pred = vmap(lambda c: dec_dens.apply(params['dec_dens'], mu, c, deterministic=True))(all_coords_norm)
-chi_pred_np = np.array(chi_pred)
-rho_pred_np = np.array(rho_pred)
+with torch.no_grad():
+    mu, log_var = encoder(mag_grid_t, grav_grid_t, hyper_t, geochem_t)
+    z_expanded = mu.unsqueeze(0).expand(all_coords_t.shape[0], -1)
+
+    chi_pred = dec_susc(z_expanded, all_coords_t, all_phi_t, all_unit_ids_t)
+    rho_pred = dec_dens(z_expanded, all_coords_t, all_phi_t, all_unit_ids_t)
+
+chi_pred_np = chi_pred.detach().numpy()
+rho_pred_np = rho_pred.detach().numpy()
 
 print(f"χ predicted: {chi_pred_np.min():.4f} – {chi_pred_np.max():.4f} SI")
 print(f"χ true:      {susceptibility_true.min():.4f} – {susceptibility_true.max():.4f} SI")
@@ -810,63 +849,40 @@ print(f"Δρ predicted: {rho_pred_np.min():.3f} – {rho_pred_np.max():.3f} g/cc
 print(f"Δρ true:      {density_true.min():.3f} – {density_true.max():.3f} g/cc")
 
 # %%
-# Verify forward models
-mag_from_pred = forward_magnetic_jax(chi_pred)
-grav_from_pred = forward_gravity_jax(rho_pred)
-print(f"Mag predicted: {float(mag_from_pred.min()):.1f} – {float(mag_from_pred.max()):.1f} nT")
-print(f"Mag observed:  {mag_observed.min():.1f} – {mag_observed.max():.1f} nT")
-print(f"Grav predicted: {float(grav_from_pred.min()):.4f} – {float(grav_from_pred.max()):.4f} mGal")
-print(f"Grav observed:  {grav_observed.min():.4f} – {grav_observed.max():.4f} mGal")
-
-# %% [markdown]
-# ## Predict compositions with MC Dropout uncertainty
-#
-# MC Dropout (Gal & Ghahramani, 2016): keep dropout active during inference.
-# Each forward pass randomly drops different neurons, effectively sampling
-# from an approximate posterior over network weights. The variance across
-# samples gives calibrated epistemic uncertainty — regions where the
-# network is unsure will show high variance because different weight
-# configurations produce different predictions.
-
-# %%
+# MC Dropout uncertainty — keep dropout ON during inference
 n_mc_samples = 50
 chi_samples = []
 rho_samples = []
 ilr_samples = []
 
-for i in range(n_mc_samples):
-    rng, rng_chi, rng_rho, rng_ilr = random.split(rng, 4)
-    keys_chi = random.split(rng_chi, all_coords_norm.shape[0])
-    keys_rho = random.split(rng_rho, all_coords_norm.shape[0])
+# Enable dropout for MC sampling
+dec_susc.train()
+dec_dens.train()
+dec_ilr.train()
 
-    # Decode with dropout ON (deterministic=False) — each pass samples different weights
-    chi_s = vmap(lambda c, k: dec_susc.apply(
-        params['dec_susc'], mu, c, deterministic=False,
-        rngs={'dropout': k}))(all_coords_norm, keys_chi)
-    rho_s = vmap(lambda c, k: dec_dens.apply(
-        params['dec_dens'], mu, c, deterministic=False,
-        rngs={'dropout': k}))(all_coords_norm, keys_rho)
+with torch.no_grad():
+    mu, _ = encoder(mag_grid_t, grav_grid_t, hyper_t, geochem_t)
+    z_expanded = mu.unsqueeze(0).expand(all_coords_t.shape[0], -1)
 
-    keys_ilr = random.split(rng_ilr, all_coords_norm.shape[0])
-    ilr_s = vmap(lambda c, ch, rh, k: dec_ilr.apply(
-        params['dec_ilr'], mu, c, ch, rh, deterministic=False,
-        rngs={'dropout': k}))(all_coords_norm, chi_s, rho_s, keys_ilr)
+    for i in range(n_mc_samples):
+        chi_s = dec_susc(z_expanded, all_coords_t, all_phi_t, all_unit_ids_t)
+        rho_s = dec_dens(z_expanded, all_coords_t, all_phi_t, all_unit_ids_t)
+        ilr_s = dec_ilr(z_expanded, all_coords_t, all_phi_t, all_unit_ids_t, chi_s, rho_s)
 
-    chi_samples.append(np.array(chi_s))
-    rho_samples.append(np.array(rho_s))
-    ilr_samples.append(np.array(ilr_s))
+        chi_samples.append(chi_s.numpy())
+        rho_samples.append(rho_s.numpy())
+        ilr_samples.append(ilr_s.numpy())
 
 chi_samples = np.stack(chi_samples)
 rho_samples = np.stack(rho_samples)
 ilr_samples = np.stack(ilr_samples)
 
-# MC Dropout statistics
 ilr_mean = ilr_samples.mean(axis=0)
 ilr_std = ilr_samples.std(axis=0)
 chi_mc_std = chi_samples.std(axis=0)
 rho_mc_std = rho_samples.std(axis=0)
 
-print(f"ILR predicted:  {ilr_mean.min():.2f} – {ilr_mean.max():.2f}")
+print(f"ILR predicted:   {ilr_mean.min():.2f} – {ilr_mean.max():.2f}")
 print(f"ILR uncertainty: {ilr_std.min():.3f} – {ilr_std.max():.3f}")
 print(f"χ uncertainty:   {chi_mc_std.min():.6f} – {chi_mc_std.max():.6f}")
 print(f"Δρ uncertainty:  {rho_mc_std.min():.5f} – {rho_mc_std.max():.5f}")
@@ -882,52 +898,45 @@ print(f"Cu true:      {Cu.min()*100:.2f}% – {Cu.max()*100:.2f}%")
 # ## Validation Metrics
 
 # %%
-def predict_ilr_at_coords(mu_latent, coords_norm, cell_idx):
-    chi_at = chi_pred[cell_idx]
-    rho_at = rho_pred[cell_idx]
-    def predict(coord, chi_l, rho_l):
-        return dec_ilr.apply(params['dec_ilr'], mu_latent, coord, chi_l, rho_l,
-                             deterministic=True)
-    return vmap(predict)(coords_norm, chi_at, rho_at)
+encoder.eval()
+dec_susc.eval()
+dec_dens.eval()
+dec_ilr.eval()
 
-# Training metrics
-train_ilr_pred = predict_ilr_at_coords(mu, train_coords_norm, train_cell_idx)
-train_rmse = float(jnp.sqrt(jnp.mean((train_ilr_pred - train_ilr)**2)))
-ss_res_train = float(jnp.sum((train_ilr_pred - train_ilr)**2))
-ss_tot_train = float(jnp.sum((train_ilr - jnp.mean(train_ilr, axis=0))**2))
-train_r2 = 1 - ss_res_train / ss_tot_train
+def r2_score(true, pred):
+    ss_res = np.sum((true - pred)**2)
+    ss_tot = np.sum((true - true.mean())**2)
+    return 1 - ss_res / ss_tot
 
-# Validation metrics
-val_ilr_pred = predict_ilr_at_coords(mu, val_coords_norm, val_cell_idx)
-val_rmse = float(jnp.sqrt(jnp.mean((val_ilr_pred - val_ilr)**2)))
-ss_res_val = float(jnp.sum((val_ilr_pred - val_ilr)**2))
-ss_tot_val = float(jnp.sum((val_ilr - jnp.mean(val_ilr, axis=0))**2))
-val_r2 = 1 - ss_res_val / ss_tot_val
+# Physical property metrics
+chi_r2 = r2_score(susceptibility_true, chi_pred_np)
+rho_r2 = r2_score(density_true, rho_pred_np)
+cu_r2 = r2_score(Cu, Cu_pred)
+cu_corr = np.corrcoef(Cu, Cu_pred)[0, 1]
 
-# Susceptibility metrics
-chi_rmse = float(np.sqrt(np.mean((chi_pred_np - susceptibility_true)**2)))
-ss_res_chi = float(np.sum((chi_pred_np - susceptibility_true)**2))
-ss_tot_chi = float(np.sum((susceptibility_true - susceptibility_true.mean())**2))
-chi_r2 = 1 - ss_res_chi / ss_tot_chi
+# Validation ILR
+with torch.no_grad():
+    mu, _ = encoder(mag_grid_t, grav_grid_t, hyper_t, geochem_t)
+    z_val = mu.unsqueeze(0).expand(val_coords_t.shape[0], -1)
+    chi_val = chi_pred[val_cell_idx]
+    rho_val = rho_pred[val_cell_idx]
+    val_phi_t = all_phi_t[val_cell_idx]
+    val_unit_ids_t = all_unit_ids_t[val_cell_idx]
+    val_ilr_pred = dec_ilr(z_val, val_coords_t, val_phi_t, val_unit_ids_t, chi_val, rho_val)
 
-# Density metrics
-rho_rmse = float(np.sqrt(np.mean((rho_pred_np - density_true)**2)))
-ss_res_rho = float(np.sum((rho_pred_np - density_true)**2))
-ss_tot_rho = float(np.sum((density_true - density_true.mean())**2))
-rho_r2 = 1 - ss_res_rho / ss_tot_rho
+val_rmse = float(torch.sqrt(torch.mean((val_ilr_pred - val_ilr_t)**2)))
 
 print(f"--- Validation Metrics ---")
-print(f"ILR Train  RMSE: {train_rmse:.4f} | R²: {train_r2:.4f}")
-print(f"ILR Val    RMSE: {val_rmse:.4f} | R²: {val_r2:.4f}")
-print(f"χ global   RMSE: {chi_rmse:.6f} | R²: {chi_r2:.4f}")
-print(f"Δρ global  RMSE: {rho_rmse:.4f} | R²: {rho_r2:.4f}")
+print(f"χ global   R²: {chi_r2:.4f}")
+print(f"Δρ global  R²: {rho_r2:.4f}")
+print(f"Cu global  R²: {cu_r2:.4f} | corr: {cu_corr:.4f}")
+print(f"ILR Val  RMSE: {val_rmse:.4f}")
 
 # %% [markdown]
 # ---
 # # Part 8: Visualizations
 
 # %%
-# Horizontal slice at mid-depth
 iz = nz // 2
 idx_slice = slice(iz * nx * ny, (iz + 1) * nx * ny)
 
@@ -943,6 +952,8 @@ df_results = pd.DataFrame({
     'uncertainty_ilr': ilr_std[idx_slice, 0],
     'uncertainty_chi': chi_mc_std[idx_slice],
     'uncertainty_rho': rho_mc_std[idx_slice],
+    'gempy_phi': scalar_field_norm[idx_slice],
+    'lithology': cell_lith_id[idx_slice],
 })
 
 df_holes_train = df_train.drop_duplicates('hole')[['x', 'y']]
@@ -951,9 +962,19 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 # %%
 (
     lp.ggplot(df_results)
+    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='gempy_phi'))
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black', fill="black")
+    + lp.scale_fill_gradient2(low='blue', mid='white', high='red', midpoint=0.5)
+    + lp.labs(title=f'GemPy scalar field φ (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
+)
+
+# %%
+(
+    lp.ggplot(df_results)
     + lp.geom_tile(mapping=lp.aes('x', 'y', fill='chi_pred'))
-    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
-    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black', fill="black")
     + lp.scale_fill_gradient(low='white', high='darkblue', name='χ (SI)')
     + lp.labs(title=f'Predicted susceptibility (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
@@ -962,8 +983,8 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 (
     lp.ggplot(df_results)
     + lp.geom_tile(mapping=lp.aes('x', 'y', fill='chi_true'))
-    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
-    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black', fill="black")
     + lp.scale_fill_gradient(low='white', high='darkblue', name='χ (SI)')
     + lp.labs(title=f'True susceptibility (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
@@ -972,8 +993,8 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 (
     lp.ggplot(df_results)
     + lp.geom_tile(mapping=lp.aes('x', 'y', fill='rho_pred'))
-    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
-    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black', fill="black")
     + lp.scale_fill_gradient(low='white', high='#2d1b69', name='Δρ (g/cc)')
     + lp.labs(title=f'Predicted density contrast (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
@@ -981,19 +1002,9 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 # %%
 (
     lp.ggplot(df_results)
-    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='rho_true'))
-    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
-    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
-    + lp.scale_fill_gradient(low='white', high='#2d1b69', name='Δρ (g/cc)')
-    + lp.labs(title=f'True density contrast (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
-)
-
-# %%
-(
-    lp.ggplot(df_results)
     + lp.geom_tile(mapping=lp.aes('x', 'y', fill='Cu_pred'))
-    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
-    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black', fill="black")
     + lp.scale_fill_gradient(low='white', high='darkred', name='Cu %')
     + lp.labs(title=f'Predicted Cu (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
@@ -1002,8 +1013,8 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 (
     lp.ggplot(df_results)
     + lp.geom_tile(mapping=lp.aes('x', 'y', fill='Cu_true'))
-    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
-    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black', fill="black")
     + lp.scale_fill_gradient(low='white', high='darkred', name='Cu %')
     + lp.labs(title=f'True Cu (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
@@ -1011,202 +1022,94 @@ df_holes_val = df_val.drop_duplicates('hole')[['x', 'y']]
 # %%
 (
     lp.ggplot(df_results)
-    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='uncertainty_ilr'))
-    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
-    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
-    + lp.scale_fill_gradient(low='white', high='purple', name='σ')
-    + lp.labs(title=f'MC Dropout uncertainty — ILR[0] (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
-)
-
-# %%
-(
-    lp.ggplot(df_results)
     + lp.geom_tile(mapping=lp.aes('x', 'y', fill='uncertainty_chi'))
-    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
-    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
+    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black')
+    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=21, size=3, color='black', fill="black")
     + lp.scale_fill_gradient(low='white', high='darkblue', name='σ_χ')
     + lp.labs(title=f'MC Dropout uncertainty — susceptibility (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
 )
 
 # %%
 (
-    lp.ggplot(df_results)
-    + lp.geom_tile(mapping=lp.aes('x', 'y', fill='uncertainty_rho'))
-    + lp.geom_point(data=df_holes_train, mapping=lp.aes('x', 'y'), shape=17, size=5, color='black')
-    + lp.geom_point(data=df_holes_val, mapping=lp.aes('x', 'y'), shape=17, size=5, color='red')
-    + lp.scale_fill_gradient(low='white', high='#2d1b69', name='σ_ρ')
-    + lp.labs(title=f'MC Dropout uncertainty — density (z={mesh.cell_centers_z[iz]:.0f}m)', x='X', y='Y')
-)
-
-# %% [markdown]
-# ## Quantitative Comparisons
-
-# %%
-(
     lp.ggplot(df_results, lp.aes('chi_true', 'chi_pred'))
+    + lp.geom_abline(slope=1, intercept=0, color='red')
     + lp.geom_point(alpha=0.5)
-    + lp.geom_abline(slope=1, intercept=0, color='red', linetype='dashed')
     + lp.labs(title='Susceptibility: predicted vs true', x='χ true', y='χ predicted')
 )
 
 # %%
 (
-    lp.ggplot(df_results, lp.aes('rho_true', 'rho_pred'))
-    + lp.geom_point(alpha=0.5)
-    + lp.geom_abline(slope=1, intercept=0, color='red', linetype='dashed')
-    + lp.labs(title='Density contrast: predicted vs true', x='Δρ true (g/cc)', y='Δρ predicted (g/cc)')
-)
-
-# %%
-(
     lp.ggplot(df_results, lp.aes('Cu_true', 'Cu_pred'))
+    + lp.geom_abline(slope=1, intercept=0, color='red')
     + lp.geom_point(alpha=0.5)
-    + lp.geom_abline(slope=1, intercept=0, color='red', linetype='dashed')
     + lp.labs(title='Cu: predicted vs true', x='Cu true (%)', y='Cu predicted (%)')
 )
-
-# %% [markdown]
-# ## Interactive 3D View
-#
-# Volumetric Cu predictions with drill hole locations.
-# Cells below a threshold are made transparent to reveal the anomaly structure.
-
-# %%
-import plotly.graph_objects as go
-
-# Build 3D volume data — show cells above a Cu threshold
-cu_threshold = 0.6  # % — show only cells with predicted Cu above this
-cu_all = Cu_pred * 100  # predicted Cu for all cells
-cu_true_all = Cu * 100
-
-# Predicted Cu — 3D scatter of enriched cells
-mask_pred = cu_all > cu_threshold
-fig = go.Figure()
-
-fig.add_trace(go.Scatter3d(
-    x=cc[mask_pred, 0], y=cc[mask_pred, 1], z=cc[mask_pred, 2],
-    mode='markers',
-    marker=dict(
-        size=5,
-        color=cu_all[mask_pred],
-        colorscale='Reds',
-        cmin=cu_threshold, cmax=cu_all.max(),
-        opacity=0.6,
-        colorbar=dict(title='Cu %', x=1.0)
-    ),
-    name='Predicted Cu',
-    hovertemplate='X=%{x:.0f}m<br>Y=%{y:.0f}m<br>Z=%{z:.0f}m<br>Cu=%{marker.color:.2f}%'
-))
-
-# True Cu — wireframe outline of enriched zone
-mask_true = cu_true_all > cu_threshold
-fig.add_trace(go.Scatter3d(
-    x=cc[mask_true, 0], y=cc[mask_true, 1], z=cc[mask_true, 2],
-    mode='markers',
-    marker=dict(size=3, color='blue', opacity=0.15, symbol='square'),
-    name='True Cu > threshold',
-    hovertemplate='X=%{x:.0f}m<br>Y=%{y:.0f}m<br>Z=%{z:.0f}m<br>Cu=%{text:.2f}%',
-    text=cu_true_all[mask_true]
-))
-
-# Drill holes
-for label, df_h, color in [('Train holes', df_holes_train, 'black'), ('Val holes', df_holes_val, 'red')]:
-    df_full = df_forages[df_forages['hole'].isin(df_h.index if 'hole' not in df_h.columns else
-              df_forages[~df_forages['is_validation']]['hole'].unique() if color == 'black' else
-              df_forages[df_forages['is_validation']]['hole'].unique())]
-    for hole_name in df_full['hole'].unique():
-        dh = df_full[df_full['hole'] == hole_name].sort_values('z', ascending=False)
-        fig.add_trace(go.Scatter3d(
-            x=dh['x'], y=dh['y'], z=dh['z'],
-            mode='lines+markers',
-            marker=dict(size=2, color=color),
-            line=dict(color=color, width=3),
-            name=hole_name,
-            showlegend=False,
-            hovertemplate=f'{hole_name}<br>Z=%{{z:.0f}}m'
-        ))
-
-fig.update_layout(
-    title='3D Cu Prediction — Predicted (red) vs True enrichment zone (blue)',
-    scene=dict(
-        xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='Z (m)',
-        aspectmode='data'
-    ),
-    width=900, height=700,
-    legend=dict(x=0, y=1)
-)
-fig.show()
 
 # %% [markdown]
 # ---
 # # Summary
 #
-# ## Multi-Sensor Data Fusion for Mineral Exploration
+# ## GemPy + NeRF Decoders for Mineral Exploration
 #
-# This exercise demonstrates a KoBold Metals-style approach to exploration
-# data integration, where multiple heterogeneous data sources are fused
-# through a shared latent space for joint geophysical-geochemical inversion.
+# This exercise demonstrates an architecture that bridges
+# geological modeling (GemPy) with data-driven inversion (NeRF decoders),
+# inspired by KoBold Metals' multi-sensor approach.
 #
-# ### Data Integration
+# ### Architecture Components
 #
-# | Source           | Information               | Role           | Loss type                |
-# |------------------|---------------------------|----------------|--------------------------|
-# | Airborne mag     | Magnetic susceptibility   | Encoder input  | Physics: G_mag @ χ       |
-# | Ground gravity   | Density contrast          | Encoder input  | Physics: G_grav @ Δρ     |
-# | Hyperspectral    | Surface alteration        | Encoder input  | (none — input only)      |
-# | Soil geochemistry| Pathfinder elements       | Encoder input  | (none — input only)      |
-# | Drill holes      | Direct Cu, Ni, Co assays  | Target only    | Decoder: z+χ+Δρ → ILR   |
+# | Component              | Tool / Method            | Role                           |
+# |------------------------|--------------------------|--------------------------------|
+# | Geological structure   | GemPy (implicit surface) | Scalar field φ + unit IDs      |
+# | Multi-sensor fusion    | CNN encoder (PyTorch)    | 4 sensors → latent z           |
+# | Property prediction    | NeRF decoders + φ input  | (z, coord, φ, unit) → χ, ρ    |
+# | Composition prediction | ILR decoder              | (z, coord, φ, unit, χ, ρ) → Cu, Ni, Co |
+# | Physics consistency    | SimPEG sensitivity       | G_mag @ χ, G_grav @ ρ         |
+# | Uncertainty            | MC Dropout (50 draws)    | Per-cell epistemic uncertainty |
 #
 # ### Key Design Choices
 #
-# 1. **Multi-branch encoder**: Each sensor has its own CNN branch,
-#    allowing the network to learn modality-specific features before
-#    fusion. This mirrors KoBold's approach of specialized processors
-#    feeding into a unified data platform (TerraShed).
+# 1. **GemPy scalar field as decoder input**: The scalar field φ(x,y,z)
+#    tells each decoder WHERE in the geological structure it's predicting.
+#    This provides geological context that the neural network alone cannot
+#    learn from surface observations. Unit embeddings further condition
+#    predictions on rock type.
 #
-# 2. **Joint inversion via shared latent space**: Susceptibility and
-#    density are decoded from the same latent vector, enforcing
-#    cross-property consistency. The ILR decoder receives both χ and Δρ
-#    as inputs, creating a direct physical bridge between geophysical
-#    properties and mineral compositions.
+# 2. **Surface sensors as encoder-only inputs**: No decoder losses on
+#    hyperspectral or soil geochemistry — avoids parasitic autoencoder
+#    shortcuts that bypass the subsurface.
 #
-# 3. **Surface inputs, subsurface targets**: Hyperspectral and geochemistry
-#    data enter through the encoder but have NO decoder losses. Adding
-#    decoder losses on encoder inputs creates a parasitic autoencoder
-#    shortcut: the network trivially memorizes surface data without
-#    learning subsurface structure. Only subsurface quantities (forward
-#    model predictions, borehole compositions) serve as training targets.
+# 3. **Physical property bridge**: The ILR decoder receives χ and Δρ as
+#    inputs, creating a direct differentiable pathway from geophysical
+#    properties to mineral compositions.
 #
-# 4. **Coordinate-conditioned decoders (NeRF-style)**: Rather than
-#    decoding z → all 2048 cells at once, each cell is predicted from
-#    (z, x, y, z_coord). Weight sharing across cells provides implicit
-#    spatial regularization, and the network can learn position-dependent
-#    anomaly patterns. This approach resolves the non-uniqueness of
-#    geophysical inversion by integrating spatial structure.
-#
-# 5. **MC Dropout uncertainty** (Gal & Ghahramani, 2016): Dropout
-#    stays active during inference, and multiple forward passes
-#    sample from an approximate posterior over network weights.
-#    This provides calibrated, spatially-varying epistemic
-#    uncertainty for exploration targeting — no arbitrary
-#    perturbation scale required.
+# 4. **Borehole lithological logs**: In real exploration, geologists log
+#    drill core lithology. These categorical labels feed into GemPy for
+#    structural modeling and into the decoders via unit embeddings.
 #
 # ### Comparison to KoBold Metals' Approach
 #
-# | KoBold                          | This Exercise                     |
-# |---------------------------------|-----------------------------------|
-# | TerraShed (data platform)       | Multi-branch encoder              |
-# | Machine Prospector (ML engine)  | Deterministic encoder + decoders  |
-# | Full-physics joint inversion    | G_mag @ χ + G_grav @ Δρ losses    |
-# | Helicopter EM / SQUID           | (could add EM forward model)      |
-# | Hyperpod (spectral + LiDAR)     | Hyperspectral CNN branch          |
-# | Geochemical analysis            | Soil geochem + drill hole assays  |
-# | Uncertainty quantification      | MC Dropout (50 draws)             |
+# | KoBold                          | This Exercise                        |
+# |---------------------------------|--------------------------------------|
+# | TerraShed (data platform)       | Multi-branch CNN encoder             |
+# | Machine Prospector (ML engine)  | NeRF decoders + GemPy structure      |
+# | Full-physics joint inversion    | G_mag @ χ + G_grav @ Δρ losses       |
+# | Geological modeling             | GemPy implicit surfaces              |
+# | Drill core logging              | Lithological logs → unit embeddings  |
+# | Uncertainty quantification      | MC Dropout (50 draws)                |
+#
+# ### Potential Extension: Pyro Integration
+#
+# Since GemPy (PyTorch) and the decoders (PyTorch) share the same autodiff
+# framework, the entire pipeline could be wrapped in a Pyro probabilistic
+# model for full Bayesian inference over both geological structure (contact
+# positions, orientations) and physical properties (decoder weights)
+# simultaneously. This would provide joint structural-property uncertainty.
 #
 # ### References
 #
 # - KoBold Metals. AI-powered mineral exploration.
 #   IEEE Spectrum (2024): https://spectrum.ieee.org/ai-mining
-# - Gal, Y. & Ghahramani, Z. (2016). Dropout as a Bayesian Approximation:
-#   Representing Model Uncertainty in Deep Learning. ICML.
+# - de la Varga et al. (2019). GemPy 1.0: open-source stochastic
+#   geological modeling and inversion. Geosci. Model Dev.
+# - Gal, Y. & Ghahramani, Z. (2016). Dropout as a Bayesian Approximation.
 # - Eagar, K. (SimPEG). Open-source geophysical modeling.

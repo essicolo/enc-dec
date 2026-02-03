@@ -56,7 +56,7 @@
         <mxCell id="e4" edge="1" source="geochem_input" target="geochem_cnn" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
 
         <!-- ==================== FUSION MLP ==================== -->
-        <mxCell id="fusion" value="&lt;b&gt;Fusion MLP&lt;/b&gt;&lt;br&gt;concat(64+64+64+32=224)&lt;br&gt;→ FC128 → ReLU → FC64 → ReLU" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+        <mxCell id="fusion" value="&lt;b&gt;Fusion MLP&lt;/b&gt;&lt;br&gt;concat(64+64+64+32=224)&lt;br&gt;→ FC128 → GeLU → FC64 → GeLU" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
           <mxGeometry x="230" y="280" width="280" height="50" as="geometry"/>
         </mxCell>
 
